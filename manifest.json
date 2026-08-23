@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dicemans.docker-vms",
+  "name": "Docker VMs",
+  "version": "1.0.0",
+  "author": "Paolo Pellicori",
+  "license": "MIT",
+  "description": "Start, restart, stop and remove Docker containers from the bar, and open a desktop session on Windows VMs.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Docker VMs",
+    "description": "Container power control and confirmed removal, plus an RDP session and web viewer button for dockur Windows/macOS VMs.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5,
+      "nameFilter": "",
+      "vmsOnly": false,
+      "showCount": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How often the container list is refreshed while the panel is open. Closed, it refreshes every 30 seconds at most."
+      },
+      {
+        "key": "nameFilter",
+        "type": "string",
+        "label": "Name filter",
+        "defaultValue": "",
+        "description": "Only show containers whose name contains this text. Empty shows all of them."
+      },
+      {
+        "key": "vmsOnly",
+        "type": "boolean",
+        "label": "Only show VMs",
+        "defaultValue": false,
+        "description": "Hide plain containers and list only Windows and macOS VMs."
+      },
+      {
+        "key": "showCount",
+        "type": "boolean",
+        "label": "Show running count in the bar",
+        "defaultValue": true
+      }
+    ]
+  }
+}

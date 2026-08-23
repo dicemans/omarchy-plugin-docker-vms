@@ -1,0 +1,254 @@
+#!/bin/bash
+
+# Helper for the io.github.dicemans.docker-vms Omarchy shell plugin.
+#
+# The QML panel stays presentational: every docker call, port lookup, and
+# client launch lives here so it can be read, tested, and fixed from a
+# terminal without touching the shell.
+#
+#   docker-vm-ctl list [name-filter]   TSV, one line per container
+#   docker-vm-ctl start|stop|restart <name>
+#   docker-vm-ctl remove <name>        delete a stopped container
+#   docker-vm-ctl connect <name>       RDP session (same as: omarchy-windows-vm launch -k)
+#   docker-vm-ctl viewer <name>        web/VNC viewer in the default browser
+#
+# `list` is the only chatty command; everything else prints a short reason on
+# failure and exits non-zero, which is what the panel surfaces as a row error.
+
+set -uo pipefail
+
+# Container ports the dockur images publish. RDP is the interactive session,
+# 8006 is the noVNC web viewer QEMU exposes over a websocket.
+RDP_CONTAINER_PORT=3389
+WEB_CONTAINER_PORT=8006
+
+# dockur's own defaults, used when a container declares neither.
+DEFAULT_USER="docker"
+DEFAULT_PASS="admin"
+
+die() {
+  echo "$1" >&2
+  exit 1
+}
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker-missing"
+}
+
+# The one place that decides whether a container is a desktop VM worth
+# offering a session button for. Image name is the honest signal: the dockur
+# images are named for their guest, and anything else is a plain container.
+kind_for() {
+  local image="${1,,}"
+  case "$image" in
+    *windows*) echo "windows" ;;
+    *macos*) echo "macos" ;;
+    *) echo "container" ;;
+  esac
+}
+
+# Go-template fragment that resolves one container port to its host port.
+#
+# HostConfig.PortBindings is asked first because it is what the container was
+# created with and survives a stop — docker's `ps` Ports column and
+# NetworkSettings.Ports are both empty while a container is down, which would
+# hide the connect button on exactly the VMs the user wants to start.
+# NetworkSettings is the fallback for `-P`, where the host port is assigned at
+# run time and HostConfig carries an empty HostPort.
+port_template() {
+  local port="$1" fallback
+  fallback='{{if $.NetworkSettings.Ports}}{{with index $.NetworkSettings.Ports "'"$port"'/tcp"}}{{(index . 0).HostPort}}{{else}}0{{end}}{{else}}0{{end}}'
+  printf '%s' '{{if $.HostConfig.PortBindings}}{{with index $.HostConfig.PortBindings "'"$port"'/tcp"}}{{(index . 0).HostPort}}{{else}}'"$fallback"'{{end}}{{else}}'"$fallback"'{{end}}'
+}
+
+# Host port for one container port, or 0. Used by connect/viewer, which act on
+# a single container and can afford their own inspect.
+bound_port() {
+  local name="$1" port="$2" value
+  value=$(docker inspect --format "$(port_template "$port")" "$name" 2>/dev/null)
+  echo "${value:-0}"
+}
+
+# Rank for list ordering: VMs first, plain containers after, each group
+# alphabetical. A stable order keeps the panel's keyboard cursor from jumping
+# between refreshes.
+kind_rank() {
+  case "$1" in
+    windows) echo 0 ;;
+    macos) echo 1 ;;
+    *) echo 2 ;;
+  esac
+}
+
+cmd_list() {
+  require_docker
+  local filter="${1:-}"
+
+  local meta
+  meta=$(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}' 2>/dev/null) \
+    || die "daemon-unreachable"
+  [[ -n $meta ]] || return 0
+
+  # One inspect for every container, so port lookup costs a single call no
+  # matter how many rows the panel shows.
+  local ids ports_raw
+  ids=$(docker ps -aq 2>/dev/null)
+  declare -A rdp_of web_of
+  if [[ -n $ids ]]; then
+    ports_raw=$(docker inspect \
+      --format "{{.Name}}{{\"\t\"}}$(port_template "$RDP_CONTAINER_PORT"){{\"\t\"}}$(port_template "$WEB_CONTAINER_PORT")" \
+      $ids 2>/dev/null)
+    local pname prdp pweb
+    while IFS=$'\t' read -r pname prdp pweb; do
+      [[ -n $pname ]] || continue
+      pname="${pname#/}"
+      rdp_of["$pname"]="${prdp:-0}"
+      web_of["$pname"]="${pweb:-0}"
+    done <<<"$ports_raw"
+  fi
+
+  local name image state status kind
+  while IFS=$'\t' read -r name image state status; do
+    [[ -n $name ]] || continue
+    if [[ -n $filter && $name != *"$filter"* ]]; then continue; fi
+    kind=$(kind_for "$image")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(kind_rank "$kind")" "$name" "$image" "$state" "$status" "$kind" \
+      "${rdp_of[$name]:-0}" "${web_of[$name]:-0}"
+  done <<<"$meta" | sort -t$'\t' -k1,1n -k2,2 | cut -f2-
+}
+
+container_exists() {
+  docker inspect "$1" >/dev/null 2>&1
+}
+
+container_state() {
+  docker inspect --format '{{.State.Status}}' "$1" 2>/dev/null
+}
+
+# Read one variable out of a container's environment, falling back to a
+# default. Values may contain '=', so only the first one splits the pair.
+container_env() {
+  local name="$1" key="$2" fallback="$3" value
+  value=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$name" 2>/dev/null \
+    | sed -n "s/^${key}=//p" | head -1)
+  echo "${value:-$fallback}"
+}
+
+# Detach GUI clients from the shell process. uwsm gives them their own
+# systemd scope, exactly as the Windows .desktop entry does; setsid is the
+# fallback for sessions without uwsm.
+launch_detached() {
+  if command -v uwsm-app >/dev/null 2>&1; then
+    uwsm-app -- "$@" >/dev/null 2>&1 &
+  else
+    setsid "$@" >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null
+}
+
+cmd_lifecycle() {
+  local action="$1" name="$2"
+  require_docker
+  [[ -n $name ]] || die "no-container"
+  container_exists "$name" || die "no-such-container"
+  docker "$action" "$name" >/dev/null 2>&1 || die "${action}-failed"
+}
+
+# Wait for the guest to answer on RDP. A cold Windows VM needs ~20-40s, so the
+# ceiling is generous; each probe is cheap and the loop exits the moment the
+# port answers.
+wait_for_rdp() {
+  local port="$1" deadline=$((SECONDS + 120))
+  while ((SECONDS < deadline)); do
+    if timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# Deleting is the one action that cannot be undone from the panel, so it is
+# deliberately narrow: only a stopped container, and never `-f` or `-v`. The
+# image and any volume — including the bind mount holding a VM's disk — are
+# left exactly where they are, so the container can be recreated over them.
+cmd_remove() {
+  local name="$1"
+  require_docker
+  [[ -n $name ]] || die "no-container"
+  container_exists "$name" || die "no-such-container"
+  [[ $(container_state "$name") != "running" ]] || die "container-running"
+  docker rm "$name" >/dev/null 2>&1 || die "remove-failed"
+}
+
+cmd_connect() {
+  local name="$1"
+  require_docker
+  [[ -n $name ]] || die "no-container"
+  container_exists "$name" || die "no-such-container"
+
+  # Containers omarchy installed keep their own launcher, which already knows
+  # the compose file, the credentials, and the display scaling. -k matches the
+  # panel's contract: connecting must never stop the VM on disconnect.
+  if [[ $name == "omarchy-windows" ]] && command -v omarchy-windows-vm >/dev/null 2>&1; then
+    launch_detached omarchy-windows-vm launch -k
+    return 0
+  fi
+
+  command -v xfreerdp3 >/dev/null 2>&1 || die "xfreerdp3-missing"
+
+  local port
+  port=$(bound_port "$name" "$RDP_CONTAINER_PORT")
+  [[ $port != "0" ]] || die "no-rdp-port"
+
+  if [[ $(container_state "$name") != "running" ]]; then
+    docker start "$name" >/dev/null 2>&1 || die "start-failed"
+  fi
+
+  local user pass
+  user=$(container_env "$name" USERNAME "$DEFAULT_USER")
+  pass=$(container_env "$name" PASSWORD "$DEFAULT_PASS")
+
+  wait_for_rdp "$port" || die "rdp-timeout"
+
+  launch_detached xfreerdp3 \
+    "/u:$user" "/p:$pass" "/v:127.0.0.1:$port" \
+    -grab-keyboard /sound /microphone /clipboard /cert:ignore \
+    "/title:$name" /dynamic-resolution /gfx:AVC444 \
+    /floatbar:sticky:off,default:visible,show:fullscreen
+}
+
+cmd_viewer() {
+  local name="$1"
+  require_docker
+  [[ -n $name ]] || die "no-container"
+  container_exists "$name" || die "no-such-container"
+
+  local port
+  port=$(bound_port "$name" "$WEB_CONTAINER_PORT")
+  [[ $port != "0" ]] || die "no-web-port"
+
+  if [[ $(container_state "$name") != "running" ]]; then
+    docker start "$name" >/dev/null 2>&1 || die "start-failed"
+  fi
+
+  local url="http://127.0.0.1:$port"
+  if command -v omarchy-launch-browser >/dev/null 2>&1; then
+    launch_detached omarchy-launch-browser "$url"
+  else
+    launch_detached xdg-open "$url"
+  fi
+}
+
+case "${1:-}" in
+  list) cmd_list "${2:-}" ;;
+  start | stop | restart) cmd_lifecycle "$1" "${2:-}" ;;
+  remove) cmd_remove "${2:-}" ;;
+  connect) cmd_connect "${2:-}" ;;
+  viewer) cmd_viewer "${2:-}" ;;
+  *)
+    echo "usage: docker-vm-ctl list [filter] | start|stop|restart|remove <name> | connect <name> | viewer <name>" >&2
+    exit 2
+    ;;
+esac
