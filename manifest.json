@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.dicemans.docker-vms",
   "name": "Docker VMs",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Paolo Pellicori",
   "license": "MIT",
   "description": "Start, restart, stop and remove Docker containers from the bar, and open a desktop session on Windows VMs.",

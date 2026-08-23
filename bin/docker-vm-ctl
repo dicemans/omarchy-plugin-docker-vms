@@ -26,9 +26,33 @@ WEB_CONTAINER_PORT=8006
 DEFAULT_USER="docker"
 DEFAULT_PASS="admin"
 
+# Hard caps on everything read from docker. A host with thousands of
+# containers, or a container whose name is a megabyte long, must not be able
+# to grow this script's memory — or the shell's, which keeps whatever we print
+# alive in a long-running process. Every producer below is bounded while it is
+# read rather than trimmed afterwards.
+MAX_ROWS=200        # containers listed
+MAX_BYTES=262144    # bytes accepted from any single docker invocation
+MAX_FIELD=512       # characters kept per field
+MAX_DIAG=400        # characters of diagnostic text ever printed
+
+# Truncate one field to MAX_FIELD and strip anything that would break the TSV
+# contract the panel parses.
+clip() {
+  local value="${1//[$'\t\n\r']/ }"
+  printf '%s' "${value:0:MAX_FIELD}"
+}
+
 die() {
-  echo "$1" >&2
+  local reason="${1:0:MAX_DIAG}"
+  echo "$reason" >&2
   exit 1
+}
+
+# A non-fatal notice. stdout still carries a valid, if partial, list; the
+# panel shows this as a footnote rather than an error.
+notice() {
+  echo "${1:0:MAX_DIAG}" >&2
 }
 
 require_docker() {
@@ -80,42 +104,66 @@ kind_rank() {
   esac
 }
 
+# Read a docker producer under a hard budget. `head` bounds it from the
+# consumer side: once the cap is reached the pipe closes and docker is stopped
+# by SIGPIPE, so the full output is never materialized anywhere. The producer's
+# own exit status is preserved through PIPESTATUS so a dead daemon is still
+# distinguishable from an empty result.
+bounded() {
+  local rows="$1"; shift
+  "$@" 2>/dev/null | head -c "$MAX_BYTES" | head -n "$rows"
+  return "${PIPESTATUS[0]}"
+}
+
 cmd_list() {
   require_docker
   local filter="${1:-}"
 
   local meta
-  meta=$(docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}' 2>/dev/null) \
+  # One extra row is requested so hitting the cap is detectable without a
+  # second, unbounded count.
+  meta=$(bounded $((MAX_ROWS + 1)) docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}') \
     || die "daemon-unreachable"
   [[ -n $meta ]] || return 0
 
+  local truncated=0
+  if (( $(printf '%s\n' "$meta" | wc -l) > MAX_ROWS )); then
+    truncated=1
+    meta=$(printf '%s\n' "$meta" | head -n "$MAX_ROWS")
+  fi
+
   # One inspect for every container, so port lookup costs a single call no
-  # matter how many rows the panel shows.
+  # matter how many rows the panel shows — bounded the same way.
   local ids ports_raw
-  ids=$(docker ps -aq 2>/dev/null)
+  ids=$(bounded "$MAX_ROWS" docker ps -aq)
   declare -A rdp_of web_of
   if [[ -n $ids ]]; then
-    ports_raw=$(docker inspect \
+    ports_raw=$(bounded "$MAX_ROWS" docker inspect \
       --format "{{.Name}}{{\"\t\"}}$(port_template "$RDP_CONTAINER_PORT"){{\"\t\"}}$(port_template "$WEB_CONTAINER_PORT")" \
-      $ids 2>/dev/null)
+      $ids)
     local pname prdp pweb
     while IFS=$'\t' read -r pname prdp pweb; do
-      [[ -n $pname ]] || continue
+      [[ -n $pname && -n $prdp ]] || continue
       pname="${pname#/}"
-      rdp_of["$pname"]="${prdp:-0}"
-      web_of["$pname"]="${pweb:-0}"
+      rdp_of["${pname:0:MAX_FIELD}"]="${prdp:0:16}"
+      web_of["${pname:0:MAX_FIELD}"]="${pweb:0:16}"
     done <<<"$ports_raw"
   fi
 
   local name image state status kind
   while IFS=$'\t' read -r name image state status; do
-    [[ -n $name ]] || continue
+    # A byte-capped read can end mid-line; a row without all four fields is
+    # dropped rather than guessed at.
+    [[ -n $name && -n $image && -n $state ]] || continue
     if [[ -n $filter && $name != *"$filter"* ]]; then continue; fi
     kind=$(kind_for "$image")
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$(kind_rank "$kind")" "$name" "$image" "$state" "$status" "$kind" \
-      "${rdp_of[$name]:-0}" "${web_of[$name]:-0}"
+      "$(kind_rank "$kind")" "$(clip "$name")" "$(clip "$image")" "$(clip "$state")" \
+      "$(clip "$status")" "$kind" \
+      "${rdp_of[${name:0:MAX_FIELD}]:-0}" "${web_of[${name:0:MAX_FIELD}]:-0}"
   done <<<"$meta" | sort -t$'\t' -k1,1n -k2,2 | cut -f2-
+
+  (( truncated == 0 )) || notice "list-truncated"
 }
 
 container_exists() {
@@ -210,13 +258,33 @@ cmd_connect() {
   user=$(container_env "$name" USERNAME "$DEFAULT_USER")
   pass=$(container_env "$name" PASSWORD "$DEFAULT_PASS")
 
-  wait_for_rdp "$port" || die "rdp-timeout"
+  wait_for_rdp "$port" || { unset pass; die "rdp-timeout"; }
 
-  launch_detached xfreerdp3 \
-    "/u:$user" "/p:$pass" "/v:127.0.0.1:$port" \
-    -grab-keyboard /sound /microphone /clipboard /cert:ignore \
-    "/title:$name" /dynamic-resolution /gfx:AVC444 \
-    /floatbar:sticky:off,default:visible,show:fullscreen
+  local -a args=(
+    "/u:${user:0:MAX_FIELD}"
+    "/p:$pass"
+    "/v:127.0.0.1:$port"
+    "-grab-keyboard" "/sound" "/microphone" "/clipboard" "/cert:ignore"
+    "/title:$(clip "$name")"
+    "/dynamic-resolution" "/gfx:AVC444"
+    "/floatbar:sticky:off,default:visible,show:fullscreen"
+  )
+
+  # The password must never reach the argument vector: /proc/<pid>/cmdline is
+  # world-readable, so `/p:secret` on the command line hands the credential to
+  # every other user on the machine. /args-from:stdin makes xfreerdp3 read its
+  # entire command line from the pipe below — one argument per line — leaving
+  # only the flag itself visible in the process list.
+  #
+  # This is also why the client is detached with setsid rather than uwsm here:
+  # uwsm hands the launch to a daemon, and the pipe would not reach the process
+  # that has to read from it.
+  printf '%s\n' "${args[@]}" | setsid xfreerdp3 /args-from:stdin >/dev/null 2>&1 &
+  disown 2>/dev/null
+
+  # Drop the secret as soon as the pipe owns it. The array is cleared too: it
+  # holds the same string.
+  unset pass args
 }
 
 cmd_viewer() {

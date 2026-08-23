@@ -2,6 +2,22 @@
 // which actions a row offers, and turning docker's vocabulary into labels.
 // Kept free of QML types so the panel stays a thin renderer.
 
+// Caps mirroring bin/docker-vm-ctl. The helper already bounds every producer;
+// these bound what the shell process is willing to hold even if it is handed
+// something else — a replaced helper, a stray file, a partial read.
+var MAX_INPUT = 262144   // characters accepted from one helper run
+var MAX_ROWS = 200       // rows kept
+var MAX_FIELD = 512      // characters kept per field
+var MAX_DIAG = 400       // characters of diagnostic text kept
+
+function clip(value) {
+  return String(value === undefined || value === null ? "" : value).slice(0, MAX_FIELD)
+}
+
+function clipDiag(value) {
+  return String(value === undefined || value === null ? "" : value).trim().slice(0, MAX_DIAG)
+}
+
 var GLYPH = {
   docker: "󰡨",
   windows: "󰍲",
@@ -19,21 +35,24 @@ var GLYPH = {
 // Anything shorter is a truncated read and is dropped rather than guessed at.
 function parseList(raw) {
   var rows = []
-  var lines = String(raw || "").split("\n")
-  for (var i = 0; i < lines.length; i++) {
+  // Bound the input before it is split: a runaway producer must not be able to
+  // turn one refresh into an unbounded array of unbounded strings.
+  var lines = String(raw || "").slice(0, MAX_INPUT).split("\n")
+  for (var i = 0; i < lines.length && rows.length < MAX_ROWS; i++) {
     if (!lines[i]) continue
     var f = lines[i].split("\t")
     if (f.length < 7) continue
-    var kind = f[4]
+    var kind = clip(f[4])
+    var state = clip(f[2])
     rows.push({
-      name: f[0],
-      image: f[1],
-      state: f[2],
-      status: f[3],
+      name: clip(f[0]),
+      image: clip(f[1]),
+      state: state,
+      status: clip(f[3]),
       kind: kind,
       rdpPort: parseInt(f[5], 10) || 0,
       webPort: parseInt(f[6], 10) || 0,
-      running: f[2] === "running",
+      running: state === "running",
       isVm: kind === "windows" || kind === "macos"
     })
   }
@@ -144,12 +163,19 @@ function errorText(code) {
     case "restart-failed": return "Could not restart the container"
     case "remove-failed": return "Could not remove the container"
     case "container-running": return "Stop the container before removing it"
+    case "list-truncated": return "Showing the first " + MAX_ROWS + " containers"
     default: return String(code).trim()
   }
 }
 
 if (typeof module !== "undefined") {
   module.exports = {
+    MAX_INPUT: MAX_INPUT,
+    MAX_ROWS: MAX_ROWS,
+    MAX_FIELD: MAX_FIELD,
+    MAX_DIAG: MAX_DIAG,
+    clip: clip,
+    clipDiag: clipDiag,
     GLYPH: GLYPH,
     parseList: parseList,
     filterRows: filterRows,

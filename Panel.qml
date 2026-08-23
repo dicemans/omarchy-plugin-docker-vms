@@ -30,6 +30,9 @@ Panel {
   // ------------------------------------------------------------------- state
   property var rows: []
   property string listError: ""
+  // A partial-but-valid list. Kept apart from listError so a host with more
+  // containers than the cap still gets a working panel plus a footnote.
+  property string listNotice: ""
   property string actionError: ""
 
   // Two independent busy slots. A session launch can sit for a minute waiting
@@ -100,6 +103,20 @@ Panel {
 
   function refresh() {
     if (!listProc.running) listProc.running = true
+  }
+
+  // Everything the helper writes to stderr arrives here, already short by
+  // contract and clipped again before it is stored: diagnostics must never be
+  // the thing that grows the shell process.
+  function applyListDiagnostic(text) {
+    var code = Model.clipDiag(text)
+    if (code === "list-truncated") {
+      listNotice = code
+      listError = ""
+      return
+    }
+    listNotice = ""
+    listError = code
   }
 
   function applyList(raw) {
@@ -254,12 +271,12 @@ Panel {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyList(text) }
     // The helper prints a short code and nothing else when it fails, so this
     // stream both sets and clears the error without a second signal to race.
-    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.listError = String(text || "").trim() }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.applyListDiagnostic(text) }
   }
 
   Process {
     id: actionProc
-    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.actionError = String(text || "").trim() }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.actionError = Model.clipDiag(text) }
     onExited: {
       root.busyName = ""
       root.busyAction = ""
@@ -269,7 +286,7 @@ Panel {
 
   Process {
     id: launchProc
-    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.actionError = String(text || "").trim() }
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.actionError = Model.clipDiag(text) }
     onExited: {
       root.launchName = ""
       root.launchAction = ""
@@ -475,6 +492,17 @@ Panel {
             row: modelData
             rowIndex: index
           }
+        }
+
+        // ---------- Partial list footnote ----------
+        Text {
+          visible: root.listNotice !== ""
+          width: parent.width
+          text: Model.errorText(root.listNotice)
+          color: Qt.darker(root.bar.foreground, 1.5)
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
         }
 
         // ---------- Last action failure ----------

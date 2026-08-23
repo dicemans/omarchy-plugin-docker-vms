@@ -151,12 +151,23 @@ process**, with your user's permissions. What this one does with them:
 - **Nothing is fetched at runtime** — no network calls, no downloads, no
   telemetry. The only outbound connection is the RDP client you asked for,
   to `127.0.0.1`.
-- **Password handling.** For a VM container that is not `omarchy-windows`, the
-  RDP password is read from the container's own environment and passed to
-  `xfreerdp3` on its command line, where it is visible in the process list to
-  other local users. This mirrors what Omarchy's own `omarchy-windows-vm`
-  does. For `omarchy-windows` the plugin delegates to that script and never
-  handles the password itself.
+- **The RDP password never reaches the argument vector.** `/proc/<pid>/cmdline`
+  is world-readable, so a credential passed as `/p:secret` is handed to every
+  other user on the machine. The plugin instead invokes
+  `xfreerdp3 /args-from:stdin` and writes the whole argument list — the
+  password included — down a pipe, so the process list shows only the flag.
+  The secret is unset as soon as the pipe owns it. This is also why the client
+  is detached with `setsid` rather than `uwsm` on that path: `uwsm` hands the
+  launch to a daemon, and the pipe would not reach the process that must read
+  it. For `omarchy-windows` the plugin delegates to `omarchy-windows-vm` and
+  never handles the password at all.
+- **Every read from docker is bounded while it is read.** A host with thousands
+  of containers, or a container with a megabyte-long name, cannot grow the
+  long-running shell process: each `docker` invocation is capped at 256 KiB and
+  200 rows by a consumer-side `head` (the producer is stopped by SIGPIPE), each
+  field is clipped to 512 characters, and diagnostics to 400. The same caps are
+  applied again in `Model.js` before anything reaches the panel. When the row
+  cap is hit the list still works and the panel says so in a footnote.
 - **Deletion is narrow by construction**: stopped containers only, plain
   `docker rm`, behind a confirmation dialog.
 
