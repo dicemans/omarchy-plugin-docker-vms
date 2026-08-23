@@ -18,6 +18,31 @@ function clipDiag(value) {
   return String(value === undefined || value === null ? "" : value).trim().slice(0, MAX_DIAG)
 }
 
+// What docker's container states actually permit. Reducing this to a single
+// `running` boolean was the source of a whole family of wrong offers: a paused
+// container was handed Start (which cannot resume it) and Remove (which docker
+// refuses), and a container in a crash loop was counted as stopped.
+//
+// `active` means the container occupies resources right now, which is what the
+// bar counts — a restart loop is very much not "stopped".
+var STATES = {
+  running:    { start: false, stopRestart: true,  remove: false, active: true },
+  paused:     { start: false, stopRestart: true,  remove: false, active: true },
+  restarting: { start: false, stopRestart: true,  remove: false, active: true },
+  created:    { start: true,  stopRestart: false, remove: true,  active: false },
+  exited:     { start: true,  stopRestart: false, remove: true,  active: false },
+  dead:       { start: false, stopRestart: false, remove: true,  active: false },
+  removing:   { start: false, stopRestart: false, remove: false, active: false }
+}
+
+// An unknown state offers nothing rather than guessing. A new docker state
+// should make the panel quiet, not make it propose actions that fail.
+var UNKNOWN_STATE = { start: false, stopRestart: false, remove: false, active: false }
+
+function stateRules(state) {
+  return STATES[String(state || "")] || UNKNOWN_STATE
+}
+
 var GLYPH = {
   docker: "󰡨",
   windows: "󰍲",
@@ -27,7 +52,8 @@ var GLYPH = {
   start: "󰐊",
   stop: "󰓛",
   restart: "󰑓",
-  remove: "󰩺"
+  remove: "󰩺",
+  alert: "󰀦"
 }
 
 // One line per container:
@@ -44,19 +70,49 @@ function parseList(raw) {
     if (f.length < 7) continue
     var kind = clip(f[4])
     var state = clip(f[2])
+    var status = clip(f[3])
     rows.push({
       name: clip(f[0]),
       image: clip(f[1]),
       state: state,
-      status: clip(f[3]),
+      status: status,
       kind: kind,
       rdpPort: parseInt(f[5], 10) || 0,
       webPort: parseInt(f[6], 10) || 0,
       running: state === "running",
-      isVm: kind === "windows" || kind === "macos"
+      active: stateRules(state).active,
+      health: healthOf(status),
+      // The image name is a hint, not proof. A dockur image re-tagged
+      // `my-vm:latest` stops looking like a VM, and a plain container tagged
+      // `:windows-test` starts looking like one. A published RDP port is the
+      // honest signal, so it counts too.
+      isVm: kind === "windows" || kind === "macos" || (parseInt(f[5], 10) || 0) > 0
     })
   }
   return rows
+}
+
+// docker already reports the healthcheck verdict inside its status string —
+// "Up 3 minutes (healthy)". The panel was printing that text and throwing the
+// meaning away, so an unhealthy container looked exactly like a sound one.
+function healthOf(status) {
+  var text = String(status || "")
+  if (text.indexOf("(unhealthy)") !== -1) return "unhealthy"
+  if (text.indexOf("(health: starting)") !== -1) return "starting"
+  if (text.indexOf("(healthy)") !== -1) return "healthy"
+  return ""
+}
+
+// A row the user should look at: failing its healthcheck, stuck in a restart
+// loop, or dead. Drives both the row colour and the bar's urgent state.
+function needsAttention(row) {
+  if (!row) return false
+  return row.health === "unhealthy" || row.state === "restarting" || row.state === "dead"
+}
+
+// Green means "running and sound", not merely "the process exists".
+function isWell(row) {
+  return !!row && row.state === "running" && row.health !== "unhealthy"
 }
 
 function filterRows(rows, vmsOnly) {
@@ -80,21 +136,28 @@ function rowIcon(row) {
 // as `omarchy-windows-vm launch -k` does.
 function rowActions(row) {
   if (!row) return []
+  var rules = stateRules(row.state)
   var actions = []
-  if (row.isVm && row.rdpPort > 0)
-    actions.push({ id: "connect", icon: GLYPH.connect, tooltip: "Open desktop session (RDP)", urgent: false })
+
+  // Offered on the port, not on the image name: whatever publishes 3389 can
+  // be connected to, and nothing else can.
+  if (row.rdpPort > 0)
+    actions.push({ id: "connect", icon: GLYPH.connect, tooltip: "Open desktop session (RDP) — 127.0.0.1:" + row.rdpPort, urgent: false })
   if (row.webPort > 0)
-    actions.push({ id: "viewer", icon: GLYPH.viewer, tooltip: "Open web viewer", urgent: false })
-  if (row.running) {
+    actions.push({ id: "viewer", icon: GLYPH.viewer, tooltip: "Open web viewer — 127.0.0.1:" + row.webPort, urgent: false })
+
+  if (rules.stopRestart) {
     actions.push({ id: "restart", icon: GLYPH.restart, tooltip: "Restart", urgent: false })
     actions.push({ id: "stop", icon: GLYPH.stop, tooltip: "Stop", urgent: true })
-  } else {
-    actions.push({ id: "start", icon: GLYPH.start, tooltip: "Start", urgent: false })
-    // Removal is offered only on a stopped container. Requiring the stop
-    // first is docker's own rule, and it means no click in this panel can
-    // destroy a VM that is mid-shutdown.
-    actions.push({ id: "remove", icon: GLYPH.remove, tooltip: "Remove container…", urgent: true })
   }
+  if (rules.start)
+    actions.push({ id: "start", icon: GLYPH.start, tooltip: "Start", urgent: false })
+  // Removal follows docker's own rule — a running, paused or restarting
+  // container cannot be removed — so no click here can destroy a container
+  // that is still doing something.
+  if (rules.remove)
+    actions.push({ id: "remove", icon: GLYPH.remove, tooltip: "Remove container…", urgent: true })
+
   return actions
 }
 
@@ -104,7 +167,13 @@ function primaryAction(row) {
   var actions = rowActions(row)
   for (var i = 0; i < actions.length; i++)
     if (actions[i].id === "connect") return "connect"
-  return row && row.running ? "stop" : "start"
+  if (!row) return ""
+  var rules = stateRules(row.state)
+  if (rules.stopRestart) return "stop"
+  if (rules.start) return "start"
+  // A dead or half-removed container has no obvious click. Better nothing
+  // than an action that is certain to fail.
+  return ""
 }
 
 function clampIndex(index, length) {
@@ -131,20 +200,38 @@ function statusText(row) {
   return row.state
 }
 
-function summary(rows) {
-  var running = 0
-  for (var i = 0; i < rows.length; i++) if (rows[i].running) running++
-  var stopped = rows.length - running
-  if (rows.length === 0) return "No containers"
-  if (stopped === 0) return running + " running"
-  if (running === 0) return stopped + " stopped"
-  return running + " running · " + stopped + " stopped"
+function countBy(rows, predicate) {
+  var n = 0
+  for (var i = 0; i < rows.length; i++) if (predicate(rows[i])) n++
+  return n
 }
 
+function activeCount(rows) {
+  return countBy(rows, function (r) { return r.active })
+}
+
+function attentionCount(rows) {
+  return countBy(rows, needsAttention)
+}
+
+// The bar's number. A restart loop counts as active: telling the user "0
+// running" while a container thrashes was the opposite of informative.
 function runningCount(rows) {
-  var n = 0
-  for (var i = 0; i < rows.length; i++) if (rows[i].running) n++
-  return n
+  return activeCount(rows)
+}
+
+function summary(rows) {
+  if (rows.length === 0) return "No containers"
+  var parts = []
+  var running = countBy(rows, function (r) { return r.state === "running" })
+  var restarting = countBy(rows, function (r) { return r.state === "restarting" })
+  var paused = countBy(rows, function (r) { return r.state === "paused" })
+  var stopped = rows.length - running - restarting - paused
+  if (running > 0) parts.push(running + " running")
+  if (restarting > 0) parts.push(restarting + " restarting")
+  if (paused > 0) parts.push(paused + " paused")
+  if (stopped > 0) parts.push(stopped + " stopped")
+  return parts.join(" · ")
 }
 
 // The helper speaks in short codes so the panel owns the wording.
@@ -153,6 +240,7 @@ function errorText(code) {
     case "": return ""
     case "docker-missing": return "Docker is not installed"
     case "daemon-unreachable": return "Docker daemon is not running"
+    case "no-container": return "No container given"
     case "no-such-container": return "Container no longer exists"
     case "no-rdp-port": return "No RDP port published"
     case "no-web-port": return "No web viewer port published"
@@ -164,7 +252,18 @@ function errorText(code) {
     case "remove-failed": return "Could not remove the container"
     case "container-running": return "Stop the container before removing it"
     case "list-truncated": return "Showing the first " + MAX_ROWS + " containers"
-    default: return String(code).trim()
+    default:
+      var text = String(code).trim()
+      // The helper forwards docker's own first line for anything it cannot
+      // name, plus `not-removable:<state>` for a state docker will not let go.
+      if (text.indexOf("not-removable:") === 0) {
+        var state = text.slice("not-removable:".length)
+        if (state === "paused") return "Unpause the container before removing it"
+        if (state === "restarting") return "The container is restarting — stop it first"
+        if (state === "running") return "Stop the container before removing it"
+        return "Docker will not remove a container in state \"" + state + "\""
+      }
+      return text
   }
 }
 
@@ -176,6 +275,12 @@ if (typeof module !== "undefined") {
     MAX_DIAG: MAX_DIAG,
     clip: clip,
     clipDiag: clipDiag,
+    stateRules: stateRules,
+    healthOf: healthOf,
+    needsAttention: needsAttention,
+    isWell: isWell,
+    attentionCount: attentionCount,
+    activeCount: activeCount,
     GLYPH: GLYPH,
     parseList: parseList,
     filterRows: filterRows,

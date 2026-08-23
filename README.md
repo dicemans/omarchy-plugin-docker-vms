@@ -60,8 +60,8 @@ no state of its own, and it never touches your containers on the way out.
 | 󰖟 | Open the web viewer in the browser | port 8006 is published |
 | 󰑓 | Restart | the container is running |
 | 󰓛 | Stop | the container is running |
-| 󰐊 | Start | the container is stopped |
-| 󰩺 | Remove container | the container is stopped |
+| 󰐊 | Start | docker can start it — `created` or `exited` |
+| 󰩺 | Remove container | docker will let it go — `created`, `exited` or `dead` |
 
 Clicking the row itself does the obvious thing: open the session on a VM,
 otherwise flip the container's power state. It never removes anything.
@@ -81,15 +81,36 @@ answer starts on *Cancel* so a stray Enter cannot delete. The confirmation is
 not something a caller can skip: the IPC `remove` below puts the same question
 on screen rather than deleting.
 
-Removal is offered only on a **stopped** container, and it runs a plain
+Removal is offered only where docker will actually allow it, and it runs a plain
 `docker rm` — never `-f`, never `-v` — so the image and every volume survive,
 including the bind mount that holds a VM's disk. Recreating the container over
 the same volume gets the machine back.
+
+## States
+
+The panel follows docker's states rather than a running/stopped guess, because
+the guess produced wrong offers: a **paused** container used to be handed *Start*
+(which cannot resume it) and *Remove* (which docker refuses), and one stuck in a
+**restart loop** was counted as stopped — the bar said "0 running" while a
+container thrashed.
+
+| State | Offered |
+|---|---|
+| `running`, `paused`, `restarting` | Restart, Stop |
+| `created`, `exited` | Start, Remove |
+| `dead` | Remove |
+| `removing`, anything unrecognised | nothing |
+
+A container failing its healthcheck, stuck restarting, or `dead` is painted in
+the urgent colour, in the row and in the bar. The bar swaps the whale for an
+alert glyph when the docker daemon cannot be reached, so a dead daemon no longer
+looks like an idle one.
 
 ## Keyboard
 
 Arrow keys (or `hjkl`) move between rows; left/right steps through a row's
 action buttons, `Enter` activates, `x` asks to remove the selected container,
+`r` refreshes now, `c` opens the desktop session and `v` the web viewer,
 `Esc` closes, `Tab` moves to the next bar panel. While the confirmation is up
 it owns the keys: left/right switch the answer, `Enter` takes it, `Esc`
 cancels.
@@ -107,7 +128,9 @@ Setup > Plugins.
 | `refreshIntervalSec` | `5` | Refresh cadence while the panel is open. Closed, it backs off to 30s. |
 | `nameFilter` | `""` | Only list containers whose name contains this text. |
 | `vmsOnly` | `false` | Hide plain containers and list only Windows/macOS VMs. |
-| `showCount` | `true` | Paint the number of running containers next to the bar glyph. |
+| `stopTimeoutSec` | `60` | Seconds docker may spend on a clean shutdown before killing the container. Docker's own default without this is 10 seconds — a power cut for a virtual machine. |
+| `rdpTimeoutSec` | `120` | Seconds to wait for a cold VM to answer on RDP before giving up. |
+| `showCount` | `true` | Paint the number of active containers next to the bar glyph. |
 
 ## IPC
 
@@ -120,6 +143,10 @@ omarchy-shell io.github.dicemans.docker-vms viewer omarchy-windows
 omarchy-shell io.github.dicemans.docker-vms start|stop|restart <container>
 omarchy-shell io.github.dicemans.docker-vms remove <container>   # asks, never deletes outright
 ```
+
+When an action fails, the panel shows **docker's own first line** — "port is
+already allocated", "cannot start a paused container, try unpause instead" —
+rather than a generic "could not start the container".
 
 The action calls answer `ok` or `busy` (another action is still in flight) —
 never a silent success. `remove` answers `confirm` once the question is on

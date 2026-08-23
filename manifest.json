@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.dicemans.docker-vms",
   "name": "Docker VMs",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Paolo Pellicori",
   "license": "MIT",
   "description": "Start, restart, stop and remove Docker containers from the bar, and open a desktop session on Windows VMs.",
@@ -22,7 +22,9 @@
       "refreshIntervalSec": 5,
       "nameFilter": "",
       "vmsOnly": false,
-      "showCount": true
+      "showCount": true,
+      "stopTimeoutSec": 60,
+      "rdpTimeoutSec": 120
     },
     "schema": [
       {
@@ -34,6 +36,26 @@
         "step": 1,
         "defaultValue": 5,
         "description": "How often the container list is refreshed while the panel is open. Closed, it refreshes every 30 seconds at most."
+      },
+      {
+        "key": "stopTimeoutSec",
+        "type": "integer",
+        "label": "Graceful stop timeout (seconds)",
+        "min": 1,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 60,
+        "description": "How long docker may spend on a clean shutdown before it kills the container. Docker's own default without this is 10 seconds, which is a power cut for a virtual machine."
+      },
+      {
+        "key": "rdpTimeoutSec",
+        "type": "integer",
+        "label": "RDP connect timeout (seconds)",
+        "min": 5,
+        "max": 600,
+        "step": 10,
+        "defaultValue": 120,
+        "description": "How long to wait for a cold VM to answer on RDP before giving up."
       },
       {
         "key": "nameFilter",

@@ -7,8 +7,9 @@
 # terminal without touching the shell.
 #
 #   docker-vm-ctl list [name-filter]   TSV, one line per container
-#   docker-vm-ctl start|stop|restart <name>
-#   docker-vm-ctl remove <name>        delete a stopped container
+#   docker-vm-ctl start|restart <name>
+#   docker-vm-ctl stop <name> [timeout-seconds]
+#   docker-vm-ctl remove <name>        delete a container docker will let go
 #   docker-vm-ctl connect <name>       RDP session (same as: omarchy-windows-vm launch -k)
 #   docker-vm-ctl viewer <name>        web/VNC viewer in the default browser
 #
@@ -25,6 +26,18 @@ WEB_CONTAINER_PORT=8006
 # dockur's own defaults, used when a container declares neither.
 DEFAULT_USER="docker"
 DEFAULT_PASS="admin"
+
+# Seconds docker waits for a graceful shutdown before SIGKILL, and seconds we
+# wait for a guest to answer on RDP. Both are overridable per call because the
+# right value is a property of the workload: a Windows VM needs far longer to
+# flush its disk than a web server needs to close its sockets.
+DEFAULT_STOP_TIMEOUT=60
+DEFAULT_RDP_TIMEOUT=120
+
+# States docker will actually let us act on. Asking docker to start a paused
+# container, or to remove one that is still running, fails — offering those
+# actions at all was the bug this table removes.
+REMOVABLE_STATES="created exited dead"
 
 # Hard caps on everything read from docker. A host with thousands of
 # containers, or a container whose name is a megabyte long, must not be able
@@ -195,19 +208,44 @@ launch_detached() {
   disown 2>/dev/null
 }
 
+# Run a docker command and, when it fails, surface docker's own first line
+# instead of a generic code. docker almost always says exactly what went wrong
+# — "port is already allocated", "no such image", "device or resource busy" —
+# and swallowing that was turning every failure into an unactionable
+# "Could not start the container".
+docker_do() {
+  local fallback="$1"
+  shift
+  local err
+  if err=$("$@" 2>&1 >/dev/null); then
+    return 0
+  fi
+  err=$(printf '%s\n' "$err" | head -1)
+  die "${err:-$fallback}"
+}
+
 cmd_lifecycle() {
-  local action="$1" name="$2"
+  local action="$1" name="$2" timeout="${3:-}"
   require_docker
   [[ -n $name ]] || die "no-container"
   container_exists "$name" || die "no-such-container"
-  docker "$action" "$name" >/dev/null 2>&1 || die "${action}-failed"
+
+  if [[ $action == "stop" ]]; then
+    # Without -t docker allows 10 seconds and then SIGKILLs. That is a hard
+    # power cut for a Windows VM mid-flush, so the caller sets the budget.
+    [[ $timeout =~ ^[0-9]+$ ]] || timeout=$DEFAULT_STOP_TIMEOUT
+    docker_do "stop-failed" docker stop -t "$timeout" "$name"
+  else
+    docker_do "${action}-failed" docker "$action" "$name"
+  fi
 }
 
 # Wait for the guest to answer on RDP. A cold Windows VM needs ~20-40s, so the
 # ceiling is generous; each probe is cheap and the loop exits the moment the
 # port answers.
 wait_for_rdp() {
-  local port="$1" deadline=$((SECONDS + 120))
+  local port="$1" budget="${2:-$DEFAULT_RDP_TIMEOUT}" deadline
+  deadline=$((SECONDS + budget))
   while ((SECONDS < deadline)); do
     if timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
       return 0
@@ -226,12 +264,20 @@ cmd_remove() {
   require_docker
   [[ -n $name ]] || die "no-container"
   container_exists "$name" || die "no-such-container"
-  [[ $(container_state "$name") != "running" ]] || die "container-running"
-  docker rm "$name" >/dev/null 2>&1 || die "remove-failed"
+  local state
+  state=$(container_state "$name")
+  if [[ " $REMOVABLE_STATES " != *" $state "* ]]; then
+    # A paused or restarting container reached this point under the old
+    # `!= running` test and then failed inside docker, after the destructive
+    # confirmation had already been shown.
+    die "not-removable:$state"
+  fi
+  docker_do "remove-failed" docker rm "$name"
 }
 
 cmd_connect() {
-  local name="$1"
+  local name="$1" rdp_timeout="${2:-}"
+  [[ $rdp_timeout =~ ^[0-9]+$ ]] || rdp_timeout=$DEFAULT_RDP_TIMEOUT
   require_docker
   [[ -n $name ]] || die "no-container"
   container_exists "$name" || die "no-such-container"
@@ -258,7 +304,7 @@ cmd_connect() {
   user=$(container_env "$name" USERNAME "$DEFAULT_USER")
   pass=$(container_env "$name" PASSWORD "$DEFAULT_PASS")
 
-  wait_for_rdp "$port" || { unset pass; die "rdp-timeout"; }
+  wait_for_rdp "$port" "$rdp_timeout" || { unset pass; die "rdp-timeout"; }
 
   local -a args=(
     "/u:${user:0:MAX_FIELD}"
@@ -311,12 +357,12 @@ cmd_viewer() {
 
 case "${1:-}" in
   list) cmd_list "${2:-}" ;;
-  start | stop | restart) cmd_lifecycle "$1" "${2:-}" ;;
+  start | stop | restart) cmd_lifecycle "$1" "${2:-}" "${3:-}" ;;
   remove) cmd_remove "${2:-}" ;;
-  connect) cmd_connect "${2:-}" ;;
+  connect) cmd_connect "${2:-}" "${3:-}" ;;
   viewer) cmd_viewer "${2:-}" ;;
   *)
-    echo "usage: docker-vm-ctl list [filter] | start|stop|restart|remove <name> | connect <name> | viewer <name>" >&2
+    echo "usage: docker-vm-ctl list [filter] | start|restart|remove <name> | stop <name> [timeout] | connect <name> [timeout] | viewer <name>" >&2
     exit 2
     ;;
 esac

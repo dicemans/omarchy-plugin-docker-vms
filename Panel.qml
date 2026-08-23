@@ -26,6 +26,11 @@ Panel {
   readonly property string nameFilter: String(setting("nameFilter", ""))
   readonly property bool vmsOnly: setting("vmsOnly", false) === true
   readonly property bool showCount: setting("showCount", true) === true
+  // Seconds docker may spend on a graceful shutdown before SIGKILL. The
+  // default of 10 that docker applies without -t is a power cut for a VM.
+  readonly property int stopTimeoutSec: Math.max(1, Number(setting("stopTimeoutSec", 60)))
+  // Seconds to wait for a cold guest to answer on RDP before giving up.
+  readonly property int rdpTimeoutSec: Math.max(5, Number(setting("rdpTimeoutSec", 120)))
 
   // ------------------------------------------------------------------- state
   property var rows: []
@@ -63,6 +68,10 @@ Panel {
 
   readonly property var visibleRows: Model.filterRows(root.rows, root.vmsOnly)
   readonly property int runningCount: Model.runningCount(root.visibleRows)
+  readonly property int attentionCount: Model.attentionCount(root.visibleRows)
+  // The bar must be able to say "something is wrong" without being opened:
+  // a dead daemon used to look exactly like an idle one.
+  readonly property bool barUrgent: root.listError !== "" || root.attentionCount > 0
   readonly property bool countInBar: root.showCount && root.runningCount > 0
 
   readonly property string stateMessage: {
@@ -153,7 +162,9 @@ Panel {
     var row = rowAt(selectedIndex)
     if (!row) return
     if (actionIndex < 0) {
-      activate(row, Model.primaryAction(row))
+      // A dead or half-removed container has no sensible primary action.
+      var primary = Model.primaryAction(row)
+      if (primary !== "") activate(row, primary)
       return
     }
     var actions = actionsAt(selectedIndex)
@@ -172,11 +183,12 @@ Panel {
     if (!name) return "no container given"
     for (var i = 0; i < visibleRows.length; i++) {
       if (visibleRows[i].name !== name) continue
-      // Courtesy check on what the panel already knows. It is not the guard:
-      // the helper refuses to remove a running container whatever we think.
-      if (visibleRows[i].running) {
-        actionError = "container-running"
-        return "container is running"
+      // Courtesy check on what the panel already knows. It is not the guard —
+      // the helper refuses whatever we think — but a destructive dialog must
+      // never be raised for an action docker is certain to reject.
+      if (!Model.stateRules(visibleRows[i].state).remove) {
+        actionError = "not-removable:" + visibleRows[i].state
+        return "not removable in state " + visibleRows[i].state
       }
       selectedIndex = i
     }
@@ -222,7 +234,9 @@ Panel {
       if (launchProc.running) return "busy"
       launchName = name
       launchAction = action
-      launchProc.command = [root.helperPath, action, name]
+      launchProc.command = action === "connect"
+        ? [root.helperPath, action, name, String(root.rdpTimeoutSec)]
+        : [root.helperPath, action, name]
       launchProc.running = true
       return "ok"
     }
@@ -230,7 +244,9 @@ Panel {
     if (actionProc.running) return "busy"
     busyName = name
     busyAction = action
-    actionProc.command = [root.helperPath, action, name]
+    actionProc.command = action === "stop"
+      ? [root.helperPath, action, name, String(root.stopTimeoutSec)]
+      : [root.helperPath, action, name]
     actionProc.running = true
     return "ok"
   }
@@ -332,12 +348,18 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.countInBar && !vertical
-      ? root.runningCount + " " + Model.GLYPH.docker
-      : Model.GLYPH.docker
-    slotSize: Style.bar.iconSlot * (root.countInBar && !vertical ? 2 : 1)
-    active: root.runningCount > 0
-    tooltipText: ""
+    text: root.listError !== ""
+      ? Model.GLYPH.alert
+      : (root.countInBar && !vertical
+        ? root.runningCount + " " + Model.GLYPH.docker
+        : Model.GLYPH.docker)
+    slotSize: Style.bar.iconSlot * (root.listError === "" && root.countInBar && !vertical ? 2 : 1)
+    active: root.runningCount > 0 || root.barUrgent
+    tooltipText: root.listError !== ""
+      ? Model.errorText(root.listError)
+      : (root.attentionCount > 0
+        ? Model.summary(root.visibleRows) + " · " + root.attentionCount + " need attention"
+        : Model.summary(root.visibleRows))
     onPressed: function (mouseButton) { root.toggle() }
   }
 
@@ -363,6 +385,14 @@ Panel {
       onActivateRequested: root.confirmOpen ? root.confirmActivate() : root.activateCursor()
       onCloseRequested: root.confirmOpen ? root.cancelRemove() : root.close()
       onDeleteRequested: if (!root.confirmOpen) root.askRemoveSelected()
+      onTextKey: function (key) {
+        if (root.confirmOpen) return
+        if (key === "r") { root.refresh(); return }
+        var row = root.rowAt(root.selectedIndex)
+        if (!row || !root.cursorActive) return
+        if (key === "c" && row.rdpPort > 0) root.activate(row, "connect")
+        else if (key === "v" && row.webPort > 0) root.activate(row, "viewer")
+      }
       onTabRequested: function (direction) { if (!root.confirmOpen) root.switchPanel(direction) }
 
       ConfirmDialog {
@@ -531,14 +561,25 @@ Panel {
     readonly property var actions: Model.rowActions(rowItem.row)
     readonly property string busy: root.rowBusyAction(rowItem.row)
     readonly property bool rowSelected: root.cursorActive && root.selectedIndex === rowItem.rowIndex
+    readonly property bool attention: Model.needsAttention(rowItem.row)
 
     hasCursor: rowSelected && root.actionIndex < 0
-    current: rowItem.row && rowItem.row.running
+    // "current" means running *and* sound. A container failing its
+    // healthcheck, or thrashing in a restart loop, must not read as fine.
+    current: Model.isWell(rowItem.row)
     foreground: root.bar.foreground
     fill: root.hoverFill
     currentFill: root.selectedFill
 
     implicitHeight: rowContent.implicitHeight + Style.spacing.rowPaddingX
+
+    PanelToolTip {
+      visible: rowMouse.containsMouse && rowItem.row
+      text: rowItem.row
+        ? rowItem.row.name + "\n" + rowItem.row.image + "\n" + Model.statusText(rowItem.row)
+        : ""
+      fontFamily: root.bar.fontFamily
+    }
 
     MouseArea {
       id: rowMouse
@@ -561,9 +602,11 @@ Panel {
       Text {
         id: rowIcon
         text: Model.rowIcon(rowItem.row)
-        color: rowItem.row && rowItem.row.running
-          ? root.bar.foreground
-          : Qt.darker(root.bar.foreground, 1.6)
+        color: rowItem.attention
+          ? root.bar.urgent
+          : (rowItem.row && rowItem.row.active
+            ? root.bar.foreground
+            : Qt.darker(root.bar.foreground, 1.6))
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.heading
         anchors.left: parent.left
@@ -592,7 +635,7 @@ Panel {
           text: rowItem.busy !== "" ? Model.busyLabel(rowItem.busy) : Model.statusText(rowItem.row)
           color: rowItem.busy !== ""
             ? root.bar.foreground
-            : Qt.darker(root.bar.foreground, 1.5)
+            : (rowItem.attention ? root.bar.urgent : Qt.darker(root.bar.foreground, 1.5))
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
