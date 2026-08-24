@@ -49,10 +49,15 @@ MAX_BYTES=262144    # bytes accepted from any single docker invocation
 MAX_FIELD=512       # characters kept per field
 MAX_DIAG=400        # characters of diagnostic text ever printed
 
-# Truncate one field to MAX_FIELD and strip anything that would break the TSV
-# contract the panel parses.
+# Field separator used to read docker's output. NOT a tab: tab counts as IFS
+# whitespace, so bash collapses runs of them and one empty field silently
+# shifts every field after it. 0x1F is not whitespace, so empty fields survive.
+FS=$'\x1f'
+
+# Truncate one field to MAX_FIELD and strip anything that would break either
+# the read separator or the TSV contract the panel parses.
 clip() {
-  local value="${1//[$'\t\n\r']/ }"
+  local value="${1//[$'\t\n\r\x1f']/ }"
   printf '%s' "${value:0:MAX_FIELD}"
 }
 
@@ -128,6 +133,15 @@ bounded() {
   return "${PIPESTATUS[0]}"
 }
 
+# Everything the panel wants from one inspect, in one template. Each piece is
+# guarded: a container without a healthcheck, without port bindings or without
+# mounts must render an empty field, not blow the template up.
+#
+# Health is reached with `index` rather than `.State.Health`, which docker's
+# formatter rejects outright ("map has no entry for key") on a container that
+# declares no healthcheck — most of them.
+DETAIL_TEMPLATE='{{with index .State "Health"}}{{.Status}}{{end}}{{"\x1f"}}{{.RestartCount}}{{"\x1f"}}{{if .HostConfig.PortBindings}}{{range $p, $b := .HostConfig.PortBindings}}{{if $b}}{{(index $b 0).HostPort}}>{{$p}} {{end}}{{end}}{{end}}{{"\x1f"}}{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}|{{end}}{{end}}'
+
 cmd_list() {
   require_docker
   local filter="${1:-}"
@@ -135,7 +149,8 @@ cmd_list() {
   local meta
   # One extra row is requested so hitting the cap is detectable without a
   # second, unbounded count.
-  meta=$(bounded $((MAX_ROWS + 1)) docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}') \
+  meta=$(bounded $((MAX_ROWS + 1)) docker ps -a --format \
+    '{{.Names}}{{"\x1f"}}{{.Image}}{{"\x1f"}}{{.State}}{{"\x1f"}}{{.Status}}{{"\x1f"}}{{.Label "com.docker.compose.project"}}{{"\x1f"}}{{.RunningFor}}') \
     || die "daemon-unreachable"
   [[ -n $meta ]] || return 0
 
@@ -149,31 +164,38 @@ cmd_list() {
   # matter how many rows the panel shows — bounded the same way.
   local ids ports_raw
   ids=$(bounded "$MAX_ROWS" docker ps -aq)
-  declare -A rdp_of web_of
+  declare -A rdp_of web_of health_of restarts_of ports_of bind_of
   if [[ -n $ids ]]; then
     ports_raw=$(bounded "$MAX_ROWS" docker inspect \
-      --format "{{.Name}}{{\"\t\"}}$(port_template "$RDP_CONTAINER_PORT"){{\"\t\"}}$(port_template "$WEB_CONTAINER_PORT")" \
+      --format "{{.Name}}{{\"\x1f\"}}$(port_template "$RDP_CONTAINER_PORT"){{\"\x1f\"}}$(port_template "$WEB_CONTAINER_PORT"){{\"\x1f\"}}$DETAIL_TEMPLATE" \
       $ids)
-    local pname prdp pweb
-    while IFS=$'\t' read -r pname prdp pweb; do
+    local pname prdp pweb phealth prestarts pports pbind key
+    while IFS="$FS" read -r pname prdp pweb phealth prestarts pports pbind; do
       [[ -n $pname && -n $prdp ]] || continue
-      pname="${pname#/}"
-      rdp_of["${pname:0:MAX_FIELD}"]="${prdp:0:16}"
-      web_of["${pname:0:MAX_FIELD}"]="${pweb:0:16}"
+      key="${pname#/}"; key="${key:0:MAX_FIELD}"
+      rdp_of["$key"]="${prdp:0:16}"
+      web_of["$key"]="${pweb:0:16}"
+      health_of["$key"]="${phealth:0:16}"
+      restarts_of["$key"]="${prestarts:0:8}"
+      ports_of["$key"]="${pports:0:MAX_FIELD}"
+      bind_of["$key"]="${pbind:0:MAX_FIELD}"
     done <<<"$ports_raw"
   fi
 
-  local name image state status kind
-  while IFS=$'\t' read -r name image state status; do
-    # A byte-capped read can end mid-line; a row without all four fields is
+  local name image state status project age kind key
+  while IFS="$FS" read -r name image state status project age; do
+    # A byte-capped read can end mid-line; a row without its leading fields is
     # dropped rather than guessed at.
     [[ -n $name && -n $image && -n $state ]] || continue
     if [[ -n $filter && $name != *"$filter"* ]]; then continue; fi
     kind=$(kind_for "$image")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    key="${name:0:MAX_FIELD}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$(kind_rank "$kind")" "$(clip "$name")" "$(clip "$image")" "$(clip "$state")" \
       "$(clip "$status")" "$kind" \
-      "${rdp_of[${name:0:MAX_FIELD}]:-0}" "${web_of[${name:0:MAX_FIELD}]:-0}"
+      "${rdp_of[$key]:-0}" "${web_of[$key]:-0}" \
+      "$(clip "$project")" "${health_of[$key]:-}" "${restarts_of[$key]:-0}" \
+      "$(clip "${ports_of[$key]:-}")" "$(clip "${bind_of[$key]:-}")"
   done <<<"$meta" | sort -t$'\t' -k1,1n -k2,2 | cut -f2-
 
   (( truncated == 0 )) || notice "list-truncated"
@@ -333,6 +355,74 @@ cmd_connect() {
   unset pass args
 }
 
+# CPU and memory. Kept out of `list` on purpose: measured on this machine,
+# `docker stats --no-stream` costs a flat ~2000 ms whether there are zero, one
+# or five containers — it waits for two samples a second apart to compute a
+# percentage — against ~60 ms for the whole of `list`. It is therefore its own
+# command, called on its own slower schedule and only when the user asks for it.
+cmd_stats() {
+  require_docker
+  bounded "$MAX_ROWS" docker stats --no-stream \
+    --format '{{.Name}}{{"\x1f"}}{{.CPUPerc}}{{"\x1f"}}{{.MemUsage}}{{"\x1f"}}{{.MemPerc}}' \
+    | while IFS="$FS" read -r sname scpu smem sperc; do
+        [[ -n $sname ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "$(clip "$sname")" "$(clip "$scpu")" "$(clip "$smem")" "$(clip "$sperc")"
+      done
+}
+
+# Open a terminal on the container. Both of these are the reason people leave
+# the panel for a shell, so they belong in it.
+cmd_terminal() {
+  local what="$1" name="$2"
+  require_docker
+  [[ -n $name ]] || die "no-container"
+  container_exists "$name" || die "no-such-container"
+  command -v omarchy-launch-terminal >/dev/null 2>&1 || die "no-terminal-launcher"
+
+  case "$what" in
+    logs)
+      launch_detached omarchy-launch-terminal -- docker logs -f --tail 200 "$name" ;;
+    shell)
+      [[ $(container_state "$name") == "running" ]] || die "container-not-running"
+      # bash is the nicer shell to land in, sh the only one every image is
+      # guaranteed to have. The choice must be a test, not a fallback: a failed
+      # `exec` terminates a non-interactive shell outright, so
+      # `exec bash || exec sh` never reaches its second branch and the terminal
+      # dies instantly on any image without bash — which is most of them.
+      launch_detached omarchy-launch-terminal -- \
+        docker exec -it "$name" sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi' ;;
+    *) die "unknown-terminal-action" ;;
+  esac
+}
+
+# Open a published port in the browser. The port comes from the panel, which
+# read it from docker, but it is re-checked here rather than trusted.
+cmd_open() {
+  local name="$1" port="$2"
+  require_docker
+  [[ -n $name ]] || die "no-container"
+  [[ $port =~ ^[0-9]{1,5}$ ]] && ((port > 0 && port < 65536)) || die "bad-port"
+  local url="http://127.0.0.1:$port"
+  if command -v omarchy-launch-browser >/dev/null 2>&1; then
+    launch_detached omarchy-launch-browser "$url"
+  else
+    launch_detached xdg-open "$url"
+  fi
+}
+
+# Open a bind-mounted host directory in the file manager — for a dockur VM this
+# is the folder shared with the guest.
+cmd_folder() {
+  local path="$1"
+  [[ -n $path ]] || die "no-folder"
+  [[ -d $path ]] || die "no-such-folder"
+  # Deliberately not omarchy-launch-nautilus: that command takes no arguments
+  # — it is hardcoded to `nautilus --new-window` — so the path was dropped in
+  # silence and the file manager opened on home instead of the shared folder.
+  # xdg-open both honours the user's chosen file manager and receives the path.
+  launch_detached xdg-open "$path"
+}
+
 cmd_viewer() {
   local name="$1"
   require_docker
@@ -357,12 +447,24 @@ cmd_viewer() {
 
 case "${1:-}" in
   list) cmd_list "${2:-}" ;;
-  start | stop | restart) cmd_lifecycle "$1" "${2:-}" "${3:-}" ;;
+  start | stop | restart | pause | unpause | kill) cmd_lifecycle "$1" "${2:-}" "${3:-}" ;;
   remove) cmd_remove "${2:-}" ;;
+  stats) cmd_stats ;;
+  logs | shell) cmd_terminal "$1" "${2:-}" ;;
+  open) cmd_open "${2:-}" "${3:-}" ;;
+  folder) cmd_folder "${2:-}" ;;
   connect) cmd_connect "${2:-}" "${3:-}" ;;
   viewer) cmd_viewer "${2:-}" ;;
   *)
-    echo "usage: docker-vm-ctl list [filter] | start|restart|remove <name> | stop <name> [timeout] | connect <name> [timeout] | viewer <name>" >&2
+    cat >&2 <<'USAGE'
+usage: docker-vm-ctl list [filter]
+       docker-vm-ctl stats
+       docker-vm-ctl start|restart|pause|unpause|kill|remove <name>
+       docker-vm-ctl stop <name> [timeout]
+       docker-vm-ctl connect <name> [timeout] | viewer <name>
+       docker-vm-ctl logs|shell <name>
+       docker-vm-ctl open <name> <host-port> | folder <path>
+USAGE
     exit 2
     ;;
 esac

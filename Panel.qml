@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -31,6 +32,12 @@ Panel {
   readonly property int stopTimeoutSec: Math.max(1, Number(setting("stopTimeoutSec", 60)))
   // Seconds to wait for a cold guest to answer on RDP before giving up.
   readonly property int rdpTimeoutSec: Math.max(5, Number(setting("rdpTimeoutSec", 120)))
+  // The performance monitor is off unless asked for. `docker stats` costs a
+  // flat ~2 seconds per call on this machine no matter how many containers
+  // there are — it waits for two samples to compute a percentage — against
+  // ~60 ms for the whole listing. Nobody should pay that without wanting it.
+  readonly property bool showStats: setting("showStats", false) === true
+  readonly property int statsIntervalSec: Math.max(5, Number(setting("statsIntervalSec", 15)))
 
   // ------------------------------------------------------------------- state
   property var rows: []
@@ -38,6 +45,12 @@ Panel {
   // A partial-but-valid list. Kept apart from listError so a host with more
   // containers than the cap still gets a working panel plus a footnote.
   property string listNotice: ""
+  // name -> {cpu, mem, memPerc}, only for running containers.
+  property var stats: ({})
+  // The row whose context menu is open, and the cursor inside it.
+  property string menuName: ""
+  property int menuIndex: 0
+  readonly property bool menuOpen: root.menuName !== ""
   property string actionError: ""
 
   // Two independent busy slots. A session launch can sit for a minute waiting
@@ -132,6 +145,11 @@ Panel {
     rows = Model.parseList(raw)
     // A container can disappear under a pending question — removed from a
     // terminal, or by another panel — and the dialog must not outlive it.
+    if (menuOpen && rows.length > 0) {
+      var menuStillThere = false
+      for (var m = 0; m < rows.length; m++) if (rows[m].name === menuName) menuStillThere = true
+      if (!menuStillThere) menuName = ""
+    }
     if (confirmOpen && rows.length > 0) {
       var stillThere = false
       for (var i = 0; i < rows.length; i++) if (rows[i].name === confirmName) stillThere = true
@@ -162,9 +180,8 @@ Panel {
     var row = rowAt(selectedIndex)
     if (!row) return
     if (actionIndex < 0) {
-      // A dead or half-removed container has no sensible primary action.
-      var primary = Model.primaryAction(row)
-      if (primary !== "") activate(row, primary)
+      // The row itself opens the menu, exactly as a click does.
+      openMenu(selectedIndex)
       return
     }
     var actions = actionsAt(selectedIndex)
@@ -226,6 +243,85 @@ Panel {
   // Returns "ok" or "busy" so callers that cannot see the panel — IPC, and a
   // keybinding through it — learn that their command was dropped rather than
   // being told it succeeded.
+  // Menu entries that are not container lifecycle: they either launch
+  // something detached or copy to the clipboard, and neither should take the
+  // single lifecycle slot.
+  function runMenu(row, item) {
+    if (!row || !item) return "no action"
+    actionError = ""
+    menuName = ""
+
+    if (item.id === "copyName" || item.id === "copyPort") {
+      copyToClipboard(item.arg)
+      return "ok"
+    }
+    if (item.id === "logs" || item.id === "shell") {
+      if (launchProc.running) return "busy"
+      launchProc.command = [root.helperPath, item.id, row.name]
+      launchName = row.name
+      launchAction = item.id
+      launchProc.running = true
+      return "ok"
+    }
+    if (item.id === "open") {
+      if (launchProc.running) return "busy"
+      launchName = row.name
+      launchAction = "open"
+      launchProc.command = [root.helperPath, "open", row.name, String(item.arg)]
+      launchProc.running = true
+      return "ok"
+    }
+    if (item.id === "folder") {
+      if (launchProc.running) return "busy"
+      launchName = row.name
+      launchAction = "folder"
+      launchProc.command = [root.helperPath, "folder", String(item.arg)]
+      launchProc.running = true
+      return "ok"
+    }
+    // pause / unpause / kill are ordinary lifecycle actions.
+    return run(row.name, item.id)
+  }
+
+  // Same shape the rest of the shell uses for clipboard writes.
+  function copyToClipboard(value) {
+    var text = String(value || "")
+    if (text === "") return
+    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
+  }
+
+  function openMenu(index) {
+    var row = rowAt(index)
+    if (!row || Model.rowMenuActions(row).length === 0) return
+    cursorActive = true
+    selectedIndex = index
+    menuIndex = 0
+    menuName = row.name
+  }
+
+  function closeMenu() { menuName = "" }
+
+  // Persisted on the widget's own shell.json entry, so the choice survives a
+  // restart and stays per-widget rather than global.
+  function toggleStats() {
+    root.settings = Object.assign({}, root.settings, { showStats: !root.showStats })
+    if (root.bar && root.bar.shell) root.bar.shell.updateEntryInline(root.moduleName, root.settings)
+  }
+
+  function menuRow() {
+    for (var i = 0; i < visibleRows.length; i++)
+      if (visibleRows[i].name === root.menuName) return visibleRows[i]
+    return null
+  }
+
+  function menuItems() { return Model.rowMenuActions(menuRow()) }
+
+  function activateMenu() {
+    var items = menuItems()
+    if (menuIndex < 0 || menuIndex >= items.length) return
+    runMenu(menuRow(), items[menuIndex])
+  }
+
   function run(name, action) {
     if (!name || !action) return "no action"
     actionError = ""
@@ -310,6 +406,27 @@ Panel {
     }
   }
 
+  Process {
+    id: statsProc
+    command: [root.helperPath, "stats"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.stats = Model.parseStats(text) }
+    // A stats failure is not a listing failure: the panel keeps working, it
+    // just shows no numbers.
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: {} }
+  }
+
+  // Deliberately a second timer rather than folding the call into the refresh:
+  // its two-second wait would otherwise hold the whole list hostage.
+  Timer {
+    interval: root.statsIntervalSec * 1000
+    running: root.opened && root.showStats
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: if (!statsProc.running) statsProc.running = true
+  }
+
+  onShowStatsChanged: if (!showStats) stats = ({})
+
   // One timer for both states: the panel wants fresh rows every few seconds
   // while it is open, the bar count only needs to be roughly right, so a
   // closed panel backs off to half a minute.
@@ -333,6 +450,7 @@ Panel {
   onOpenedChanged: {
     if (!opened) {
       confirmName = ""
+      menuName = ""
       return
     }
     refresh()
@@ -371,22 +489,42 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(430))
-    contentHeight: panel.fittedContentHeight(root.confirmOpen
-      ? Math.max(column.implicitHeight, Style.space(200))
-      : column.implicitHeight)
+    // The overlays are drawn inside the panel, so the panel has to be tall
+    // enough to hold them. Without this the menu's items rendered past the
+    // card and onto the desktop, because nothing below clips.
+    contentHeight: panel.fittedContentHeight(
+      root.menuOpen
+        ? Math.max(column.implicitHeight, menuColumn.implicitHeight + Style.space(52))
+        : (root.confirmOpen
+          ? Math.max(column.implicitHeight, Style.space(200))
+          : column.implicitHeight))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
       onMoveRequested: function (dx, dy) {
         if (root.confirmOpen) { root.confirmToggleChoice(); return }
+        if (root.menuOpen) {
+          if (dy !== 0) root.menuIndex = Model.clampIndex(root.menuIndex + dy, root.menuItems().length)
+          return
+        }
         root.moveCursor(dx, dy)
       }
-      onActivateRequested: root.confirmOpen ? root.confirmActivate() : root.activateCursor()
-      onCloseRequested: root.confirmOpen ? root.cancelRemove() : root.close()
-      onDeleteRequested: if (!root.confirmOpen) root.askRemoveSelected()
+      onActivateRequested: {
+        if (root.confirmOpen) root.confirmActivate()
+        else if (root.menuOpen) root.activateMenu()
+        else root.activateCursor()
+      }
+      onCloseRequested: {
+        if (root.confirmOpen) root.cancelRemove()
+        else if (root.menuOpen) root.closeMenu()
+        else root.close()
+      }
+      onDeleteRequested: if (!root.confirmOpen && !root.menuOpen) root.askRemoveSelected()
       onTextKey: function (key) {
-        if (root.confirmOpen) return
+        if (root.confirmOpen || root.menuOpen) return
+        if (key === "m") { root.openMenu(root.selectedIndex); return }
+        if (key === "s") { root.toggleStats(); return }
         if (key === "r") { root.refresh(); return }
         var row = root.rowAt(root.selectedIndex)
         if (!row || !root.cursorActive) return
@@ -394,6 +532,107 @@ Panel {
         else if (key === "v" && row.webPort > 0) root.activate(row, "viewer")
       }
       onTabRequested: function (direction) { if (!root.confirmOpen) root.switchPanel(direction) }
+
+      // The extras live here rather than as more buttons on every row: a
+      // right-click asks for them, and they are gone again the moment the
+      // question is answered. Drawn inside the panel, like the confirmation,
+      // so there is no second surface to focus or dismiss.
+      Rectangle {
+        id: menuOverlay
+        anchors.fill: parent
+        z: 9
+        visible: root.menuOpen
+        color: Util.alpha(root.bar ? root.bar.background : Color.background, 0.85)
+
+        MouseArea { anchors.fill: parent; onClicked: root.closeMenu() }
+
+        BorderSurface {
+          id: menuCard
+          width: Math.min(parent.width - Style.space(24), Style.space(320))
+          height: Math.min(parent.height - Style.space(16), menuColumn.implicitHeight + Style.space(24))
+          anchors.centerIn: parent
+          // Belt and braces: if the panel could not grow enough (a very short
+          // screen), the menu is cut off rather than painted over the desktop.
+          clip: true
+          color: root.bar ? root.bar.background : Color.background
+          borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
+          radius: Style.cornerRadius
+
+          MouseArea { anchors.fill: parent; onClicked: {} }
+
+          Column {
+            id: menuColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(12)
+            spacing: Style.space(2)
+
+            Text {
+              text: root.menuName
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+              width: parent.width
+            }
+
+            // The image lives here now: too long for the row, and this is
+            // where you look when you want to know what a container actually
+            // is rather than what it is doing.
+            Text {
+              readonly property var forRow: root.menuRow()
+              visible: text !== ""
+              text: forRow ? forRow.image : ""
+              color: Qt.darker(root.bar.foreground, 1.5)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              width: parent.width
+              bottomPadding: Style.space(8)
+            }
+
+            Repeater {
+              model: root.menuItems()
+
+              CursorSurface {
+                id: menuRow
+                required property var modelData
+                required property int index
+
+                width: menuColumn.width
+                implicitHeight: menuLabel.implicitHeight + Style.space(10)
+                hasCursor: root.menuIndex === index
+                foreground: root.bar.foreground
+                fill: root.hoverFill
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onContainsMouseChanged: if (containsMouse) root.menuIndex = menuRow.index
+                  onClicked: root.runMenu(root.menuRow(), menuRow.modelData)
+                }
+
+                Text {
+                  id: menuLabel
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  text: menuRow.modelData.icon + "  " + menuRow.modelData.label
+                  color: menuRow.modelData.urgent ? root.bar.urgent : root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+              }
+            }
+          }
+        }
+      }
 
       ConfirmDialog {
         id: confirmDialog
@@ -476,10 +715,51 @@ Panel {
 
         PanelSeparator { foreground: root.bar.foreground }
 
-        PanelSectionHeader {
-          text: root.vmsOnly ? "VIRTUAL MACHINES" : "CONTAINERS"
-          foreground: root.bar.foreground
-          fontFamily: root.bar.fontFamily
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(sectionHeader.implicitHeight, statsSwitch.implicitHeight)
+
+          PanelSectionHeader {
+            id: sectionHeader
+            text: root.vmsOnly ? "VIRTUAL MACHINES" : "CONTAINERS"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          // Opt-in performance monitor, labelled and next to the list it
+          // changes. It sat unlabelled in the header corner and nobody found
+          // it — a switch with no name is not a feature, it is a puzzle.
+          Text {
+            id: statsLabel
+            text: "CPU & RAM"
+            color: root.showStats ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.6)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.letterSpacing: 1.2
+            anchors.right: statsSwitch.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          ToggleSwitch {
+            id: statsSwitch
+            checked: root.showStats
+            foreground: root.bar.foreground
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            onToggled: root.toggleStats()
+
+            PanelToolTip {
+              visible: statsSwitch.containsMouse
+              text: root.showStats
+                ? "CPU and memory on, sampled every " + root.statsIntervalSec + "s  ·  key: s"
+                : "Show CPU and memory. Costs a ~2s docker call each sample, on its own timer  ·  key: s"
+              fontFamily: root.bar.fontFamily
+            }
+          }
         }
 
         // ---------- Empty / error state ----------
@@ -585,9 +865,14 @@ Panel {
       id: rowMouse
       anchors.fill: parent
       hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton
       cursorShape: Qt.PointingHandCursor
       onContainsMouseChanged: if (containsMouse) root.focusRow(rowItem.rowIndex, -1)
-      onClicked: root.activate(rowItem.row, Model.primaryAction(rowItem.row))
+      // Either button opens the menu. Start, stop and restart already have
+      // their own buttons on the row, so making the row itself a shortcut for
+      // one of them only made it a place where a stray click did something
+      // unexpected.
+      onClicked: root.openMenu(rowItem.rowIndex)
     }
 
     Item {
@@ -636,6 +921,19 @@ Panel {
           color: rowItem.busy !== ""
             ? root.bar.foreground
             : (rowItem.attention ? root.bar.urgent : Qt.darker(root.bar.foreground, 1.5))
+          font.family: root.bar.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+          width: parent.width
+        }
+
+        // What the container *is*, under what it is *doing*. Dimmer than the
+        // status line so the eye still lands on the state first.
+        Text {
+          readonly property string detail: Model.detailLine(rowItem.row, root.stats[rowItem.row ? rowItem.row.name : ""])
+          visible: detail !== ""
+          text: detail
+          color: Qt.darker(root.bar.foreground, 1.9)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight

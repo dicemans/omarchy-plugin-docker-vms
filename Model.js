@@ -5,6 +5,10 @@
 // Caps mirroring bin/docker-vm-ctl. The helper already bounds every producer;
 // these bound what the shell process is willing to hold even if it is handed
 // something else — a replaced helper, a stray file, a partial read.
+// Fields the helper emits per row. A short row is a truncated read, not a
+// container: it is dropped rather than half-parsed.
+var FIELDS = 12
+
 var MAX_INPUT = 262144   // characters accepted from one helper run
 var MAX_ROWS = 200       // rows kept
 var MAX_FIELD = 512      // characters kept per field
@@ -26,18 +30,18 @@ function clipDiag(value) {
 // `active` means the container occupies resources right now, which is what the
 // bar counts — a restart loop is very much not "stopped".
 var STATES = {
-  running:    { start: false, stopRestart: true,  remove: false, active: true },
-  paused:     { start: false, stopRestart: true,  remove: false, active: true },
-  restarting: { start: false, stopRestart: true,  remove: false, active: true },
-  created:    { start: true,  stopRestart: false, remove: true,  active: false },
-  exited:     { start: true,  stopRestart: false, remove: true,  active: false },
-  dead:       { start: false, stopRestart: false, remove: true,  active: false },
-  removing:   { start: false, stopRestart: false, remove: false, active: false }
+  running:    { start: false, stopRestart: true,  remove: false, active: true,  pause: true,  unpause: false, kill: true,  shell: true },
+  paused:     { start: false, stopRestart: true,  remove: false, active: true,  pause: false, unpause: true,  kill: false, shell: false },
+  restarting: { start: false, stopRestart: true,  remove: false, active: true,  pause: false, unpause: false, kill: true,  shell: false },
+  created:    { start: true,  stopRestart: false, remove: true,  active: false, pause: false, unpause: false, kill: false, shell: false },
+  exited:     { start: true,  stopRestart: false, remove: true,  active: false, pause: false, unpause: false, kill: false, shell: false },
+  dead:       { start: false, stopRestart: false, remove: true,  active: false, pause: false, unpause: false, kill: false, shell: false },
+  removing:   { start: false, stopRestart: false, remove: false, active: false, pause: false, unpause: false, kill: false, shell: false }
 }
 
 // An unknown state offers nothing rather than guessing. A new docker state
 // should make the panel quiet, not make it propose actions that fail.
-var UNKNOWN_STATE = { start: false, stopRestart: false, remove: false, active: false }
+var UNKNOWN_STATE = { start: false, stopRestart: false, remove: false, active: false, pause: false, unpause: false, kill: false, shell: false }
 
 function stateRules(state) {
   return STATES[String(state || "")] || UNKNOWN_STATE
@@ -53,7 +57,15 @@ var GLYPH = {
   stop: "󰓛",
   restart: "󰑓",
   remove: "󰩺",
-  alert: "󰀦"
+  alert: "󰀦",
+  logs: "󰦪",
+  shell: "󰆍",
+  pause: "󰏤",
+  play: "󰐊",
+  kill: "󰚌",
+  web: "󰖟",
+  folder: "󰉋",
+  copy: "󰆏"
 }
 
 // One line per container:
@@ -67,7 +79,7 @@ function parseList(raw) {
   for (var i = 0; i < lines.length && rows.length < MAX_ROWS; i++) {
     if (!lines[i]) continue
     var f = lines[i].split("\t")
-    if (f.length < 7) continue
+    if (f.length < FIELDS) continue
     var kind = clip(f[4])
     var state = clip(f[2])
     var status = clip(f[3])
@@ -79,9 +91,16 @@ function parseList(raw) {
       kind: kind,
       rdpPort: parseInt(f[5], 10) || 0,
       webPort: parseInt(f[6], 10) || 0,
+      project: clip(f[7]),
+      // docker reports health twice: structurally, and inside the status
+      // string. The structured field is authoritative; the string is the
+      // fallback for a docker that did not fill it in.
+      health: clip(f[8]) || healthOf(status),
+      restarts: parseInt(f[9], 10) || 0,
+      ports: parsePorts(f[10]),
+      binds: parseBinds(f[11]),
       running: state === "running",
       active: stateRules(state).active,
-      health: healthOf(status),
       // The image name is a hint, not proof. A dockur image re-tagged
       // `my-vm:latest` stops looking like a VM, and a plain container tagged
       // `:windows-test` starts looking like one. A published RDP port is the
@@ -107,12 +126,58 @@ function healthOf(status) {
 // loop, or dead. Drives both the row colour and the bar's urgent state.
 function needsAttention(row) {
   if (!row) return false
-  return row.health === "unhealthy" || row.state === "restarting" || row.state === "dead"
+  if (row.state === "restarting" || row.state === "dead") return true
+  // Health only means something while the container is up. docker keeps
+  // reporting the last verdict after a stop, and painting a deliberately
+  // stopped container red because its final probe failed is noise, not news.
+  return row.active && row.health === "unhealthy"
 }
 
 // Green means "running and sound", not merely "the process exists".
 function isWell(row) {
   return !!row && row.state === "running" && row.health !== "unhealthy"
+}
+
+// "8080>80/tcp 5432>5432/tcp" -> [{host, container, proto}]. Ports arrive from
+// HostConfig, so they survive a stop; udp duplicates of a tcp port are dropped
+// because they would show as a second identical-looking entry.
+function parsePorts(raw) {
+  var out = []
+  var seen = {}
+  var parts = String(raw || "").trim().split(/\s+/)
+  for (var i = 0; i < parts.length && out.length < 24; i++) {
+    var m = /^(\d{1,5})>(\d{1,5})\/(tcp|udp)$/.exec(parts[i])
+    if (!m) continue
+    if (m[3] !== "tcp") continue
+    if (seen[m[1]]) continue
+    seen[m[1]] = true
+    out.push({ host: parseInt(m[1], 10), container: parseInt(m[2], 10), proto: m[3] })
+  }
+  return out
+}
+
+function parseBinds(raw) {
+  var out = []
+  var parts = String(raw || "").split("|")
+  for (var i = 0; i < parts.length && out.length < 8; i++)
+    if (parts[i]) out.push(clip(parts[i]))
+  return out
+}
+
+// CPU and memory, keyed by container name. Only running containers appear —
+// docker stats says nothing about the others, and neither should the panel.
+function parseStats(raw) {
+  var byName = {}
+  var lines = String(raw || "").slice(0, MAX_INPUT).split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    if (!lines[i]) continue
+    var f = lines[i].split("\t")
+    if (f.length < 4) continue
+    // "8.154GiB / 15.31GiB" -> the used half is the only interesting one here.
+    var used = clip(f[2]).split("/")[0].trim()
+    byName[clip(f[0])] = { cpu: clip(f[1]), mem: used, memPerc: clip(f[3]) }
+  }
+  return byName
 }
 
 function filterRows(rows, vmsOnly) {
@@ -161,19 +226,49 @@ function rowActions(row) {
   return actions
 }
 
-// Clicking the row itself does the obvious thing: open the session on a VM
-// that has one, otherwise flip the container's power state.
-function primaryAction(row) {
-  var actions = rowActions(row)
-  for (var i = 0; i < actions.length; i++)
-    if (actions[i].id === "connect") return "connect"
-  if (!row) return ""
+// The right-click menu: everything that does not earn a permanent button.
+// Each entry carries its own argument, so the panel dispatches without
+// re-deriving anything — the menu and the command cannot disagree.
+function rowMenuActions(row) {
+  if (!row) return []
   var rules = stateRules(row.state)
-  if (rules.stopRestart) return "stop"
-  if (rules.start) return "start"
-  // A dead or half-removed container has no obvious click. Better nothing
-  // than an action that is certain to fail.
-  return ""
+  var items = []
+
+  items.push({ id: "logs", icon: GLYPH.logs, label: "View logs" })
+  // Offered on VMs too. There the shell lands in the container that runs
+  // QEMU, not inside the guest — which is exactly where you look when a VM
+  // will not boot, so the label says which side you are getting rather than
+  // hiding the entry.
+  if (rules.shell)
+    items.push({
+      id: "shell",
+      icon: GLYPH.shell,
+      label: row.isVm ? "Open a shell (container)" : "Open a shell"
+    })
+
+  if (rules.pause) items.push({ id: "pause", icon: GLYPH.pause, label: "Pause" })
+  if (rules.unpause) items.push({ id: "unpause", icon: GLYPH.play, label: "Resume" })
+  if (rules.kill) items.push({ id: "kill", icon: GLYPH.kill, label: "Kill now", urgent: true })
+
+  // One entry per published port, so the common "which port was it again?"
+  // question is answered by the menu itself rather than by docker ps.
+  for (var i = 0; i < row.ports.length && i < 6; i++) {
+    var p = row.ports[i]
+    if (p.host === row.rdpPort) continue
+    items.push({ id: "open", icon: GLYPH.web, label: "Open 127.0.0.1:" + p.host, arg: String(p.host) })
+  }
+
+  for (var b = 0; b < row.binds.length && b < 3; b++) {
+    var path = row.binds[b]
+    var name = path.split("/").filter(function (x) { return x }).pop() || path
+    items.push({ id: "folder", icon: GLYPH.folder, label: "Open folder " + name, arg: path })
+  }
+
+  items.push({ id: "copyName", icon: GLYPH.copy, label: "Copy name", arg: row.name })
+  if (row.ports.length > 0)
+    items.push({ id: "copyPort", icon: GLYPH.copy, label: "Copy port " + row.ports[0].host, arg: String(row.ports[0].host) })
+
+  return items
 }
 
 function clampIndex(index, length) {
@@ -218,6 +313,22 @@ function attentionCount(rows) {
 // running" while a container thrashes was the opposite of informative.
 function runningCount(rows) {
   return activeCount(rows)
+}
+
+// The second line under a container's name: how it is behaving, not what it
+// is. The image is the longest field and the least urgent, so it moved to the
+// menu header where there is room to read it without eliding.
+function detailLine(row, stat) {
+  if (!row) return ""
+  var parts = []
+  if (row.active && row.health && row.health !== "healthy") parts.push(row.health)
+  if (stat && stat.cpu) parts.push("cpu " + stat.cpu)
+  if (stat && stat.mem) parts.push(stat.mem)
+  if (row.project) parts.push(row.project)
+  if (row.restarts > 0) parts.push(row.restarts + (row.restarts === 1 ? " restart" : " restarts"))
+  if (row.ports.length === 1) parts.push("port " + row.ports[0].host)
+  else if (row.ports.length > 1) parts.push(row.ports.length + " ports")
+  return parts.join(" · ")
 }
 
 function summary(rows) {
@@ -283,10 +394,14 @@ if (typeof module !== "undefined") {
     activeCount: activeCount,
     GLYPH: GLYPH,
     parseList: parseList,
+    parseStats: parseStats,
+    parsePorts: parsePorts,
+    parseBinds: parseBinds,
+    rowMenuActions: rowMenuActions,
+    detailLine: detailLine,
     filterRows: filterRows,
     rowIcon: rowIcon,
     rowActions: rowActions,
-    primaryAction: primaryAction,
     clampIndex: clampIndex,
     busyLabel: busyLabel,
     statusText: statusText,

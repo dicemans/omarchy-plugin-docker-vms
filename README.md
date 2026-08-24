@@ -63,9 +63,6 @@ no state of its own, and it never touches your containers on the way out.
 | 󰐊 | Start | docker can start it — `created` or `exited` |
 | 󰩺 | Remove container | docker will let it go — `created`, `exited` or `dead` |
 
-Clicking the row itself does the obvious thing: open the session on a VM,
-otherwise flip the container's power state. It never removes anything.
-
 The session button starts a stopped VM before connecting, so it is a single
 click from "off" to "at the Windows desktop". For the container Omarchy
 installs (`omarchy-windows`) it delegates to `omarchy-windows-vm launch -k`,
@@ -73,6 +70,47 @@ which already knows the compose file, the credentials, and the display
 scaling — and `-k` means closing the RDP window leaves the VM running. Any
 other VM container is connected to directly with `xfreerdp3`, using the
 `USERNAME` / `PASSWORD` the container was created with.
+
+**Clicking a row opens its menu.** Starting, stopping and restarting already
+have their own buttons, so making the row a shortcut for one of them only
+created a place where a stray click did something unexpected.
+
+Under each name sits a second line: how the container is *behaving* — health,
+CPU and memory when the monitor is on, compose project, restart count,
+published ports. What it *is* — the image — lives in the menu header, where
+there is room to read it without eliding.
+
+## The menu
+
+![The container menu](menu.png)
+
+A click on the row, or `m` from the keyboard. Everything that does not earn a
+permanent button lives here, and it is built from the container's state, so it
+never offers something docker would refuse:
+
+| Entry | Shown when |
+|---|---|
+| View logs | always — `docker logs -f --tail 200` in a terminal |
+| Open a shell | any running container. On a VM it is labelled *(container)*, because it lands in the container running QEMU rather than inside the guest — which is exactly where you look when a VM will not boot |
+| Pause / Resume | running / paused |
+| Kill now | running or restarting |
+| Open 127.0.0.1:*port* | one entry per published port, in the browser |
+| Open folder *name* | one entry per bind mount |
+| Copy name, Copy port | always |
+
+## Performance monitor
+
+Off by default. The switch sits next to the **CONTAINERS** heading, labelled
+`CPU & RAM`, and `s` toggles it from the keyboard.
+
+The reason it is opt-in is measurable: on the machine this was built on,
+`docker stats --no-stream` costs a flat **~2000 ms** whether there are zero,
+one or five containers — it waits for two samples a second apart to compute a
+percentage — against **~60 ms** for the entire listing. The cost is a wait, not
+CPU: the whole refresh loop is under 0.2% of an eight-core machine either way.
+But a two-second wait inside the refresh would make the panel feel broken, so
+when the monitor is on the numbers come from a second, slower timer in its own
+process, and the list keeps its own pace.
 
 ## Removing a container always asks first
 
@@ -111,7 +149,10 @@ looks like an idle one.
 Arrow keys (or `hjkl`) move between rows; left/right steps through a row's
 action buttons, `Enter` activates, `x` asks to remove the selected container,
 `r` refreshes now, `c` opens the desktop session and `v` the web viewer,
-`Esc` closes, `Tab` moves to the next bar panel. While the confirmation is up
+`m` (or `Enter` on the row) opens the menu, `s` toggles the performance
+monitor, `Esc` closes,
+`Tab` moves to the next bar panel. Every action the panel offers is reachable
+without a mouse. While the confirmation is up
 it owns the keys: left/right switch the answer, `Enter` takes it, `Esc`
 cancels.
 
@@ -130,6 +171,8 @@ Setup > Plugins.
 | `vmsOnly` | `false` | Hide plain containers and list only Windows/macOS VMs. |
 | `stopTimeoutSec` | `60` | Seconds docker may spend on a clean shutdown before killing the container. Docker's own default without this is 10 seconds — a power cut for a virtual machine. |
 | `rdpTimeoutSec` | `120` | Seconds to wait for a cold VM to answer on RDP before giving up. |
+| `showStats` | `false` | Show CPU and memory. See the note above on why this is opt-in. |
+| `statsIntervalSec` | `15` | How often CPU and memory are sampled while the monitor is on. |
 | `showCount` | `true` | Paint the number of active containers next to the bar glyph. |
 
 ## IPC
@@ -205,7 +248,8 @@ manifest.json          plugin manifest (bar-widget, entry point, settings schema
 Panel.qml              bar button + panel
 Model.js               parsing and per-row action rules, no QML types
 bin/docker-vm-ctl      every docker call, port lookup, and client launch
-preview.png            the screenshot above
+preview.png            the panel screenshot
+menu.png               the menu screenshot
 LICENSE                MIT
 ```
 

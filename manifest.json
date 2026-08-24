@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.dicemans.docker-vms",
   "name": "Docker VMs",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "author": "Paolo Pellicori",
   "license": "MIT",
-  "description": "Start, restart, stop and remove Docker containers from the bar, and open a desktop session on Windows VMs.",
+  "description": "Start, restart, stop, pause and remove Docker containers from the bar, read their logs, open a shell, and open a desktop session on Windows VMs.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Docker VMs",
-    "description": "Container power control and confirmed removal, plus an RDP session and web viewer button for dockur Windows/macOS VMs.",
+    "description": "Container control with logs, shell and an opt-in performance monitor, plus an RDP session and web viewer for dockur Windows/macOS VMs.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -24,7 +24,9 @@
       "vmsOnly": false,
       "showCount": true,
       "stopTimeoutSec": 60,
-      "rdpTimeoutSec": 120
+      "rdpTimeoutSec": 120,
+      "showStats": false,
+      "statsIntervalSec": 15
     },
     "schema": [
       {
@@ -56,6 +58,23 @@
         "step": 10,
         "defaultValue": 120,
         "description": "How long to wait for a cold VM to answer on RDP before giving up."
+      },
+      {
+        "key": "showStats",
+        "type": "boolean",
+        "label": "Show CPU and memory",
+        "defaultValue": false,
+        "description": "Adds a performance line to every running container. Off by default: the docker call behind it waits about two seconds each time, against roughly sixty milliseconds for the whole listing. It runs on its own slower timer so the list stays responsive."
+      },
+      {
+        "key": "statsIntervalSec",
+        "type": "integer",
+        "label": "Performance refresh (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 15,
+        "description": "How often CPU and memory are sampled while the performance monitor is on."
       },
       {
         "key": "nameFilter",
