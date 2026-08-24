@@ -381,7 +381,21 @@ cmd_terminal() {
 
   case "$what" in
     logs)
-      launch_detached omarchy-launch-terminal -- docker logs -f --tail 200 "$name" ;;
+      # The window has to outlive the command. `docker logs -f` has nothing to
+      # follow on a stopped container, so it printed and exited, the terminal
+      # closed in the same instant, and the logs were unreadable exactly when
+      # they matter most — after something died. 130 means the user pressed
+      # Ctrl-C, and then closing immediately is what they asked for.
+      #
+      # The container name goes in as a positional argument rather than being
+      # interpolated into the script, so no name can ever be read as shell.
+      launch_detached omarchy-launch-terminal -- bash -c '
+        docker logs -f --tail 200 "$1"
+        status=$?
+        [ $status -eq 130 ] && exit 0
+        printf "\n\n— end of logs — press any key to close —"
+        read -r -n1 -s
+      ' _ "$name" ;;
     shell)
       [[ $(container_state "$name") == "running" ]] || die "container-not-running"
       # bash is the nicer shell to land in, sh the only one every image is
@@ -389,8 +403,16 @@ cmd_terminal() {
       # `exec` terminates a non-interactive shell outright, so
       # `exec bash || exec sh` never reaches its second branch and the terminal
       # dies instantly on any image without bash — which is most of them.
-      launch_detached omarchy-launch-terminal -- \
-        docker exec -it "$name" sh -c 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi' ;;
+      # Same reasoning as the logs window, but only on failure: leaving a shell
+      # is meant to close it, while a `docker exec` that refused should stay on
+      # screen long enough to read why.
+      launch_detached omarchy-launch-terminal -- bash -c '
+        docker exec -it "$1" sh -c "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+        status=$?
+        [ $status -eq 0 ] && exit 0
+        printf "\n— the shell exited with status %s — press any key to close —" "$status"
+        read -r -n1 -s
+      ' _ "$name" ;;
     *) die "unknown-terminal-action" ;;
   esac
 }
@@ -402,6 +424,11 @@ cmd_open() {
   require_docker
   [[ -n $name ]] || die "no-container"
   [[ $port =~ ^[0-9]{1,5}$ ]] && ((port > 0 && port < 65536)) || die "bad-port"
+  # The panel already hides this on a stopped container, but the panel works
+  # from a list that is seconds old. Nothing is listening on a published port
+  # while the container is down, so refuse rather than open a dead tab.
+  container_exists "$name" || die "no-such-container"
+  [[ $(container_state "$name") == "running" ]] || die "container-not-running"
   local url="http://127.0.0.1:$port"
   if command -v omarchy-launch-browser >/dev/null 2>&1; then
     launch_detached omarchy-launch-browser "$url"

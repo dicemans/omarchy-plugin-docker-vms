@@ -63,8 +63,12 @@ no state of its own, and it never touches your containers on the way out.
 | 󰐊 | Start | docker can start it — `created` or `exited` |
 | 󰩺 | Remove container | docker will let it go — `created`, `exited` or `dead` |
 
-The session button starts a stopped VM before connecting, so it is a single
-click from "off" to "at the Windows desktop". For the container Omarchy
+The session and viewer buttons start a stopped VM before connecting, but they
+**ask first**: a click meant as "connect" should not silently boot several
+gigabytes of Windows. Answer *Start* and it is a single step from "off" to "at
+the Windows desktop"; the question is skipped entirely when the container is
+already running. The same confirmation applies to the `rdp` and `viewer` IPC
+calls, so a keybinding cannot power on a VM without asking either. For the container Omarchy
 installs (`omarchy-windows`) it delegates to `omarchy-windows-vm launch -k`,
 which already knows the compose file, the credentials, and the display
 scaling — and `-k` means closing the RDP window leaves the VM running. Any
@@ -90,11 +94,11 @@ never offers something docker would refuse:
 
 | Entry | Shown when |
 |---|---|
-| View logs | always — `docker logs -f --tail 200` in a terminal |
+| View logs | always — `docker logs -f --tail 200` in a terminal that waits for a key before closing, so a stopped container's logs stay readable instead of flashing past |
 | Open a shell | any running container. On a VM it is labelled *(container)*, because it lands in the container running QEMU rather than inside the guest — which is exactly where you look when a VM will not boot |
 | Pause / Resume | running / paused |
 | Kill now | running or restarting |
-| Open 127.0.0.1:*port* | one entry per published port, in the browser |
+| Open 127.0.0.1:*port* | one entry per published port, **while the container is running** — a published port survives a stop, but nothing is listening on it, so the entry would only ever open a dead tab |
 | Open folder *name* | one entry per bind mount |
 | Copy name, Copy port | always |
 
@@ -112,17 +116,30 @@ But a two-second wait inside the refresh would make the panel feel broken, so
 when the monitor is on the numbers come from a second, slower timer in its own
 process, and the list keeps its own pace.
 
-## Removing a container always asks first
+## What the panel asks before doing
 
-The trash button opens a confirmation dialog naming the container, and the
-answer starts on *Cancel* so a stray Enter cannot delete. The confirmation is
-not something a caller can skip: the IPC `remove` below puts the same question
-on screen rather than deleting.
+Two things never happen on a single click.
 
-Removal is offered only where docker will actually allow it, and it runs a plain
-`docker rm` — never `-f`, never `-v` — so the image and every volume survive,
-including the bind mount that holds a VM's disk. Recreating the container over
-the same volume gets the machine back.
+![Starting a stopped VM asks first](confirm.png)
+
+**Removing a container.** The dialog names it, and the answer starts on
+*Cancel* so a stray Enter cannot delete. Removal is offered only where docker
+will actually allow it, and it runs a plain `docker rm` — never `-f`, never
+`-v` — so the image and every volume survive, including the bind mount that
+holds a VM's disk. Recreating the container over the same volume gets the
+machine back.
+
+**Starting a stopped VM.** The session and viewer buttons still take you from
+"off" to the Windows desktop in one step, but they ask first: a click meant as
+"connect" should not silently boot several gigabytes of Windows. Here the
+answer starts on *Start*, because you did just ask for it and nothing is
+destroyed — and the accent colour, rather than the warning red used for
+removal, says the same thing.
+
+Neither question is something a caller can skip. The IPC `remove`, `rdp` and
+`viewer` calls all put the dialog on screen instead of acting, so a keybinding
+obeys the same gate as a click — including for a container the panel has not
+listed yet.
 
 ## States
 
@@ -250,6 +267,7 @@ Model.js               parsing and per-row action rules, no QML types
 bin/docker-vm-ctl      every docker call, port lookup, and client launch
 preview.png            the panel screenshot
 menu.png               the menu screenshot
+confirm.png            the confirmation screenshot
 LICENSE                MIT
 ```
 

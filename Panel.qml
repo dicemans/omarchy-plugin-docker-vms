@@ -61,10 +61,35 @@ Panel {
   property string launchName: ""
   property string launchAction: ""
 
-  // Removal is the one irreversible action here, so it never runs straight
-  // from a click: the name sits here until the dialog is answered.
+  // Actions that must not run straight from a click park here until the
+  // dialog is answered: removal, because it cannot be undone, and starting a
+  // stopped VM, because a click meant as "connect" should not silently boot
+  // eight gigabytes of Windows.
   property string confirmName: ""
-  readonly property bool confirmOpen: root.confirmName !== ""
+  property string confirmAction: ""
+  // Which button the answer is on. Kept here rather than inside the dialog so
+  // keyboard and mouse drive one value instead of two that can disagree.
+  property int confirmIndex: 0
+  readonly property bool confirmOpen: root.confirmName !== "" && root.confirmAction !== ""
+
+  readonly property bool confirmIsDestructive: root.confirmAction === "remove"
+
+  readonly property string confirmMessage: {
+    if (!confirmOpen) return ""
+    if (confirmAction === "remove")
+      return "Remove container \"" + confirmName + "\"?\nIts image and volumes are kept."
+    // Only assert "is not running" when the listing actually says so.
+    var known = false
+    for (var i = 0; i < visibleRows.length; i++)
+      if (visibleRows[i].name === confirmName && visibleRows[i].state !== "running") known = true
+    var lead = known ? "\"" + confirmName + "\" is not running.\nStart it and "
+                     : "Start \"" + confirmName + "\" if needed and "
+    if (confirmAction === "connect") return lead + "open a desktop session?"
+    if (confirmAction === "viewer") return lead + "open the web viewer?"
+    return ""
+  }
+
+  readonly property string confirmButton: root.confirmAction === "remove" ? "Remove" : "Start"
 
   // actionIndex -1 means the cursor is on the row itself (primary action);
   // 0..n-1 selects one of the row's action buttons.
@@ -153,7 +178,7 @@ Panel {
     if (confirmOpen && rows.length > 0) {
       var stillThere = false
       for (var i = 0; i < rows.length; i++) if (rows[i].name === confirmName) stillThere = true
-      if (!stillThere) confirmName = ""
+      if (!stillThere) { confirmName = ""; confirmAction = "" }
     }
     selectedIndex = Model.clampIndex(selectedIndex, visibleRows.length)
     var actions = actionsAt(selectedIndex)
@@ -193,6 +218,9 @@ Panel {
   function activate(row, action) {
     if (!row || !action) return "no action"
     if (action === "remove") return askRemove(row.name)
+    // Both of these start the container when it is down; ask first.
+    if ((action === "connect" || action === "viewer") && row.state !== "running")
+      return askStart(row.name, action)
     return run(row.name, action)
   }
 
@@ -211,7 +239,36 @@ Panel {
     }
     actionError = ""
     // Land on Cancel, not Confirm: a stray Enter must never delete.
-    confirmDialog.selectedIndex = 0
+    confirmIndex = 0
+    confirmAction = "remove"
+    confirmName = name
+    return "confirm"
+  }
+
+  // Connecting to a stopped VM means booting it first. That is slow and costly
+  // enough that it should be a decision, not a side effect of a click aimed at
+  // the session button. The default answer is the affirmative here — unlike
+  // removal — because the user did just ask for it and nothing is destroyed.
+  // The IPC entry point: resolves a name to a row so callers without a cursor
+  // go through exactly the same gate as a click.
+  function activateByName(name, action) {
+    for (var i = 0; i < visibleRows.length; i++)
+      if (visibleRows[i].name === name) return activate(visibleRows[i], action)
+    // Not in the last listing — a container created seconds ago, or a panel
+    // that has not polled yet. The confirmation must not be skippable by that
+    // race, so ask anyway and word the question without claiming a state we
+    // do not know.
+    if (action === "connect" || action === "viewer") return askStart(name, action)
+    return run(name, action)
+  }
+
+  function askStart(name, action) {
+    if (!name) return "no container given"
+    for (var i = 0; i < visibleRows.length; i++)
+      if (visibleRows[i].name === name) selectedIndex = i
+    actionError = ""
+    confirmIndex = 1
+    confirmAction = action
     confirmName = name
     return "confirm"
   }
@@ -223,20 +280,23 @@ Panel {
 
   function cancelRemove() {
     confirmName = ""
+    confirmAction = ""
   }
 
   function confirmRemove() {
     var name = root.confirmName
+    var action = root.confirmAction
     confirmName = ""
-    run(name, "remove")
+    confirmAction = ""
+    if (action !== "") run(name, action)
   }
 
   function confirmToggleChoice() {
-    confirmDialog.selectedIndex = confirmDialog.selectedIndex === 0 ? 1 : 0
+    confirmIndex = confirmIndex === 0 ? 1 : 0
   }
 
   function confirmActivate() {
-    if (confirmDialog.selectedIndex === 0) cancelRemove()
+    if (confirmIndex === 0) cancelRemove()
     else confirmRemove()
   }
 
@@ -365,8 +425,10 @@ Panel {
     function start(name: string): string { return root.run(name, "start") }
     function stop(name: string): string { return root.run(name, "stop") }
     function restart(name: string): string { return root.run(name, "restart") }
-    function rdp(name: string): string { return root.run(name, "connect") }
-    function viewer(name: string): string { return root.run(name, "viewer") }
+    // Routed through activate(), not run(), so a keybinding obeys the same
+    // confirmation as a click: neither should boot a stopped VM in silence.
+    function rdp(name: string): string { return root.activateByName(name, "connect") }
+    function viewer(name: string): string { return root.activateByName(name, "viewer") }
 
     // Deliberately not a silent delete: this opens the panel and puts the
     // question on screen, so the confirmation holds no matter who calls.
@@ -450,6 +512,7 @@ Panel {
   onOpenedChanged: {
     if (!opened) {
       confirmName = ""
+      confirmAction = ""
       menuName = ""
       return
     }
@@ -634,18 +697,101 @@ Panel {
         }
       }
 
-      ConfirmDialog {
-        id: confirmDialog
+      // A confirmation whose affirmative button is not always a warning.
+      // Ui/ConfirmDialog paints its second button with the urgent colour by
+      // construction — right for "Remove", wrong for "Start", and the colour
+      // is not exposed as a property. Geometry, padding and type sizes mirror
+      // it so the two read as the same dialog; only the meaning of the accent
+      // changes.
+      Rectangle {
+        id: confirmSurface
         anchors.fill: parent
-        z: 10
-        opened: root.confirmOpen
-        message: "Remove container \"" + root.confirmName + "\"?\nIts image and volumes are kept."
-        confirmText: "Remove"
-        background: root.bar ? root.bar.background : Color.background
-        foreground: root.bar ? root.bar.foreground : Color.foreground
-        fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
-        onCanceled: root.cancelRemove()
-        onConfirmed: root.confirmRemove()
+        z: 11
+        visible: root.confirmOpen
+        color: Util.alpha(root.bar ? root.bar.background : Color.background, 0.7)
+
+        MouseArea { anchors.fill: parent; onClicked: root.cancelRemove() }
+
+        BorderSurface {
+          id: confirmCard
+          width: Math.min(parent.width - Style.space(32), Style.space(370))
+          height: confirmCard.contentTopInset + confirmCard.contentBottomInset
+            + confirmText.implicitHeight + Style.space(20) + Style.space(34)
+          anchors.centerIn: parent
+          color: root.bar ? root.bar.background : Color.background
+          borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
+          padding: Style.space(18)
+          radius: Style.cornerRadius
+
+          MouseArea { anchors.fill: parent; onClicked: {} }
+
+          Item {
+            anchors.fill: parent
+            anchors.topMargin: confirmCard.contentTopInset
+            anchors.rightMargin: confirmCard.contentRightInset
+            anchors.bottomMargin: confirmCard.contentBottomInset
+            anchors.leftMargin: confirmCard.contentLeftInset
+
+            Text {
+              id: confirmText
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              text: root.confirmMessage
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.title
+              wrapMode: Text.WordWrap
+            }
+
+            Row {
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              spacing: Style.space(10)
+
+              Repeater {
+                model: ["Cancel", root.confirmButton]
+
+                BorderSurface {
+                  required property int index
+                  required property string modelData
+
+                  readonly property bool selected: root.confirmIndex === index
+                  // Only the affirmative button of a destructive question
+                  // wears the warning colour. "Start" gets the accent.
+                  readonly property bool warns: index === 1 && root.confirmIsDestructive
+                  readonly property color tone: warns ? root.bar.urgent : Color.accent
+
+                  width: Style.space(88)
+                  height: Style.space(34)
+                  radius: 0
+                  color: selected ? Util.alpha(tone, warns ? 0.22 : 0.12) : "transparent"
+                  borderSpec: Border.flat(selected ? tone : Util.alpha(warns ? tone : root.bar.foreground, warns ? 0.56 : 0.38),
+                    Style.normalBorderWidth)
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: modelData
+                    color: selected ? tone : root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: root.confirmIndex = index
+                    onClicked: {
+                      root.confirmIndex = index
+                      root.confirmActivate()
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
 
       Column {

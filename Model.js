@@ -250,9 +250,18 @@ function rowMenuActions(row) {
   if (rules.unpause) items.push({ id: "unpause", icon: GLYPH.play, label: "Resume" })
   if (rules.kill) items.push({ id: "kill", icon: GLYPH.kill, label: "Kill now", urgent: true })
 
-  // One entry per published port, so the common "which port was it again?"
-  // question is answered by the menu itself rather than by docker ps.
-  for (var i = 0; i < row.ports.length && i < 6; i++) {
+  // One entry per published port — but only while something is listening on
+  // them. A published port survives a stop, so offering to open it on a
+  // stopped container handed the user a browser tab pointing at nothing.
+  // "Copy port" stays available either way: that is configuration, not a
+  // live endpoint.
+  //
+  // The test is "running", not "active": a paused container still holds its
+  // port bound while its processes are frozen, so the tab would hang on a
+  // socket nobody is going to answer. This matches the helper, which refuses
+  // anything but a running container.
+  var reachable = row.state === "running"
+  for (var i = 0; reachable && i < row.ports.length && i < 6; i++) {
     var p = row.ports[i]
     if (p.host === row.rdpPort) continue
     items.push({ id: "open", icon: GLYPH.web, label: "Open 127.0.0.1:" + p.host, arg: String(p.host) })
@@ -355,6 +364,7 @@ function errorText(code) {
     case "no-such-container": return "Container no longer exists"
     case "no-rdp-port": return "No RDP port published"
     case "no-web-port": return "No web viewer port published"
+    case "container-not-running": return "Start the container first"
     case "xfreerdp3-missing": return "xfreerdp3 is not installed"
     case "rdp-timeout": return "The VM did not answer on RDP"
     case "start-failed": return "Could not start the container"
