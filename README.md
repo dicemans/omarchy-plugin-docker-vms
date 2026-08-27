@@ -10,7 +10,7 @@ and open a desktop session on a Windows (or macOS) VM built from the
 
 | Dependency | Needed for | Notes |
 |---|---|---|
-| `docker` CLI | everything | Your user must be able to run `docker` without `sudo` (usually via the `docker` group). |
+| `docker` CLI | everything | Your user must be able to run `docker` without `sudo` (usually via the `docker` group). Not there yet? The panel offers to fix it — see [Starting the daemon](#starting-the-daemon). |
 | `omarchy-windows-vm` | the session button on the `omarchy-windows` container | Ships with Omarchy. |
 | `xfreerdp3` | the session button on any other VM container | Package `freerdp`. Omarchy installs it with `omarchy-windows-vm install`. |
 | `omarchy-launch-browser` or `xdg-open` | the web viewer button | One of the two is present on any desktop. |
@@ -161,6 +161,29 @@ the urgent colour, in the row and in the bar. The bar swaps the whale for an
 alert glyph when the docker daemon cannot be reached, so a dead daemon no longer
 looks like an idle one.
 
+## Starting the daemon
+
+A docker the panel cannot reach is the one listing failure it can fix itself,
+so it does not stop at the diagnosis: a **󰐊 Start Docker** button appears
+where the container list would be (`Enter` takes it too), and it repairs
+whatever actually stands in the way — through polkit, in a **single**
+authorization, because the shell has no terminal to put a `sudo` prompt in:
+
+- the daemon is down → `systemctl start docker.service`. For *this* session
+  only; it never enables the service at boot.
+- the socket refuses your user (the button then reads **Fix Docker access**)
+  → your user joins the `docker` group, the fix docker's own documentation
+  prescribes, plus an ACL on the socket so it works *now* rather than at your
+  next login. The ACL dies with the daemon; the group is what remains.
+- a fresh machine has both problems at once → both fixes, still one dialog.
+
+The tooltip says which of these the click will do before you click. After the
+authorization the helper waits up to 30 seconds for the socket to answer, so
+the next refresh paints the container list rather than the error it just
+fixed. A dismissed authorization dialog is reported as exactly that, not as a
+failure — and if the ACL half of the grant could not land (no `setfacl` on
+the machine), the panel says the part that is left: log out and back in.
+
 ## Keyboard
 
 Arrow keys (or `hjkl`) move between rows; left/right steps through a row's
@@ -202,6 +225,7 @@ omarchy-shell io.github.dicemans.docker-vms rdp omarchy-windows
 omarchy-shell io.github.dicemans.docker-vms viewer omarchy-windows
 omarchy-shell io.github.dicemans.docker-vms start|stop|restart <container>
 omarchy-shell io.github.dicemans.docker-vms remove <container>   # asks, never deletes outright
+omarchy-shell io.github.dicemans.docker-vms startDocker          # start the daemon; polkit still asks
 ```
 
 When an action fails, the panel shows **docker's own first line** — "port is
@@ -257,6 +281,13 @@ process**, with your user's permissions. What this one does with them:
   cap is hit the list still works and the panel says so in a footnote.
 - **Deletion is narrow by construction**: stopped containers only, plain
   `docker rm`, behind a confirmation dialog.
+- **One privileged path, declared up front.** The only thing the plugin ever
+  does with root is the fix behind the *Start Docker / Fix Docker access*
+  button: start `docker.service`, join the `docker` group, ACL the socket —
+  nothing else, and never without a polkit authorization. The button's tooltip
+  states what the click will do before it is clicked, and the username reaches
+  the root script as a positional argument, never interpolated, so no name can
+  be read as shell.
 
 ## Layout
 
@@ -283,7 +314,8 @@ believes, so the guard holds even if the list on screen is a few seconds
 stale.
 
 `list` prints one TSV line per container: name, image, state, status, kind,
-RDP port, web port. Ports are read from `HostConfig.PortBindings`, which
+RDP port, web port, compose project, health, restart count, published ports,
+bind mounts. Ports are read from `HostConfig.PortBindings`, which
 survives a stop — `docker ps` reports no ports at all for a stopped container,
 which would otherwise hide the connect button on exactly the VMs you want to
 start.

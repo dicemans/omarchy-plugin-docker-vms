@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.dicemans.docker-vms",
   "name": "Docker VMs",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "author": "Paolo Pellicori",
   "license": "MIT",
-  "description": "Start, restart, stop, pause and remove Docker containers from the bar, read their logs, open a shell, and open a desktop session on Windows VMs.",
+  "description": "Start, restart, stop, pause and remove Docker containers from the bar, read their logs, open a shell, and open a desktop session on Windows VMs. When docker itself is out of reach — daemon down, or no access to the socket — one button fixes it behind a single polkit authorization.",
   "kinds": [
     "bar-widget"
   ],

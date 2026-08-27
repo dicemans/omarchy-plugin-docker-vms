@@ -360,6 +360,8 @@ function errorText(code) {
     case "": return ""
     case "docker-missing": return "Docker is not installed"
     case "daemon-unreachable": return "Docker daemon is not running"
+    case "docker-permission": return "No permission on Docker's socket"
+    case "daemon-grant-relogin": return "Access granted — log out and back in to finish"
     case "no-container": return "No container given"
     case "no-such-container": return "Container no longer exists"
     case "no-rdp-port": return "No RDP port published"
@@ -372,6 +374,12 @@ function errorText(code) {
     case "restart-failed": return "Could not restart the container"
     case "remove-failed": return "Could not remove the container"
     case "container-running": return "Stop the container before removing it"
+    // The daemon-start command speaks polkit as well as docker.
+    case "no-systemctl": return "systemctl is not available"
+    case "polkit-missing": return "pkexec is not installed"
+    case "daemon-start-dismissed": return "Authorization dismissed — nothing was changed"
+    case "daemon-start-failed": return "Could not start the Docker daemon"
+    case "daemon-start-timeout": return "Docker started but is not answering yet"
     case "list-truncated": return "Showing the first " + MAX_ROWS + " containers"
     default:
       var text = String(code).trim()

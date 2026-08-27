@@ -112,6 +112,16 @@ Panel {
   readonly property bool barUrgent: root.listError !== "" || root.attentionCount > 0
   readonly property bool countInBar: root.showCount && root.runningCount > 0
 
+  // The listing failures the panel can fix itself. Everything else in
+  // errorText is a diagnosis; these get a button. A stopped daemon and a
+  // refused socket need different words but the same gesture: one click,
+  // one polkit authorization, and the helper repairs whatever mix of the
+  // two it finds.
+  readonly property bool daemonDown: root.listError === "daemon-unreachable"
+  readonly property bool accessDenied: root.listError === "docker-permission"
+  readonly property bool daemonFixable: root.daemonDown || root.accessDenied
+  property bool daemonBusy: false
+
   readonly property string stateMessage: {
     if (root.listError !== "") return Model.errorText(root.listError)
     if (root.visibleRows.length === 0) return root.vmsOnly ? "No VMs" : "No containers"
@@ -200,7 +210,22 @@ Panel {
     }
   }
 
+  // Starting the daemon leaves docker's remit — it goes through polkit, so
+  // the click may be answered by a password dialog rather than a result. Its
+  // own busy slot: it must not block, or be blocked by, container actions.
+  function startDaemon() {
+    if (daemonProc.running) return "busy"
+    actionError = ""
+    daemonBusy = true
+    daemonProc.command = [root.helperPath, "daemon-start"]
+    daemonProc.running = true
+    return "ok"
+  }
+
   function activateCursor() {
+    // With docker out of reach the list is empty and there is exactly one
+    // thing Enter can mean, so it works before the cursor is revealed.
+    if (daemonFixable) { startDaemon(); return }
     if (!cursorActive) { cursorActive = true; return }
     var row = rowAt(selectedIndex)
     if (!row) return
@@ -436,6 +461,10 @@ Panel {
       root.open()
       return root.askRemove(name)
     }
+
+    // Same gate as the panel's play button: polkit still asks, so this is
+    // safe to put on a key.
+    function startDocker(): string { return root.startDaemon() }
   }
 
   // ---------------------------------------------------------------- processes
@@ -464,6 +493,15 @@ Panel {
     onExited: {
       root.launchName = ""
       root.launchAction = ""
+      root.refresh()
+    }
+  }
+
+  Process {
+    id: daemonProc
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: root.actionError = Model.clipDiag(text) }
+    onExited: {
+      root.daemonBusy = false
       root.refresh()
     }
   }
@@ -917,6 +955,67 @@ Panel {
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body
           elide: Text.ElideRight
+        }
+
+        // ---------- Docker out of reach: offer the fix, not just the diagnosis ----------
+        // The hero already says what is wrong; this is the way to change it
+        // without leaving the panel. Enter takes it too.
+        BorderSurface {
+          id: daemonStartButton
+          visible: root.daemonFixable
+          readonly property color tone: root.daemonBusy ? Util.alpha(root.bar.foreground, 0.38) : Color.accent
+
+          width: Math.min(parent.width, Style.space(220))
+          height: Style.space(38)
+          anchors.horizontalCenter: parent.horizontalCenter
+          radius: Style.cornerRadius
+          color: daemonStartMouse.containsMouse && !root.daemonBusy ? Util.alpha(Color.accent, 0.12) : "transparent"
+          borderSpec: Border.flat(daemonStartButton.tone, Style.normalBorderWidth)
+
+          Row {
+            anchors.centerIn: parent
+            spacing: Style.space(8)
+
+            Text {
+              text: Model.GLYPH.play
+              color: daemonStartButton.tone
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.heading
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Text {
+              text: root.daemonBusy
+                ? (root.accessDenied ? "Fixing access…" : "Starting Docker…")
+                : (root.accessDenied ? "Fix Docker access" : "Start Docker")
+              color: root.daemonBusy ? Qt.darker(root.bar.foreground, 1.4) : root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.body
+              anchors.verticalCenter: parent.verticalCenter
+            }
+          }
+
+          MouseArea {
+            id: daemonStartMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: !root.daemonBusy
+            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onClicked: root.startDaemon()
+          }
+
+          // The tooltip says exactly what the click will do with root: joining
+          // the docker group is a real security decision, and a button that
+          // does it silently would be hiding the one fact worth knowing.
+          PanelToolTip {
+            visible: daemonStartMouse.containsMouse
+            text: root.daemonBusy
+              ? "Waiting for the daemon to answer"
+              : (root.accessDenied
+                ? "Add your user to the docker group and open the socket for this session (asks for authorization)  ·  key: Enter"
+                : "Start the Docker daemon — and grant your user access if it lacks it (asks for authorization)  ·  key: Enter")
+            fontFamily: root.bar.fontFamily
+          }
         }
 
         // ---------- Container rows ----------

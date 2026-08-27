@@ -77,6 +77,24 @@ require_docker() {
   command -v docker >/dev/null 2>&1 || die "docker-missing"
 }
 
+# The daemon being down and the socket refusing this user look identical from
+# `docker ps` — both are one failed connection. They need different words and
+# different fixes: the play button can start a stopped daemon, but it cannot
+# put the user in the docker group.
+docker_permission_denied() {
+  # Not a pipe into grep: this script runs under pipefail, and `docker
+  # version` exits non-zero exactly when it prints this error, which made the
+  # pipeline "fail" even as grep matched.
+  local out
+  out=$(docker version 2>&1)
+  [[ ${out,,} == *"permission denied"* ]]
+}
+
+diagnose_unreachable() {
+  docker_permission_denied && die "docker-permission"
+  die "daemon-unreachable"
+}
+
 # The one place that decides whether a container is a desktop VM worth
 # offering a session button for. Image name is the honest signal: the dockur
 # images are named for their guest, and anything else is a plain container.
@@ -151,7 +169,7 @@ cmd_list() {
   # second, unbounded count.
   meta=$(bounded $((MAX_ROWS + 1)) docker ps -a --format \
     '{{.Names}}{{"\x1f"}}{{.Image}}{{"\x1f"}}{{.State}}{{"\x1f"}}{{.Status}}{{"\x1f"}}{{.Label "com.docker.compose.project"}}{{"\x1f"}}{{.RunningFor}}') \
-    || die "daemon-unreachable"
+    || diagnose_unreachable
   [[ -n $meta ]] || return 0
 
   local truncated=0
@@ -355,6 +373,81 @@ cmd_connect() {
   unset pass args
 }
 
+# Put a working docker in front of this user. Everything else in this file
+# talks to a docker that already answers; this is the one command that needs
+# privileges. It runs from the shell process with no terminal attached, so the
+# elevation goes through polkit (pkexec), which asks graphically — sudo would
+# have nowhere to put its password prompt.
+#
+# Two different things can stand between the user and the socket — the daemon
+# is down, or the socket refuses them — and a fresh machine usually has both
+# at once. Whatever the mix, it is repaired in ONE pkexec call, so the user
+# authenticates once, not once per problem:
+#   - start docker.service when it is not running (`start`, never `enable`:
+#     the user asked for docker now, not at every boot);
+#   - when the user is not in the docker group, join it — the fix docker's
+#     own documentation prescribes — plus an ACL on the socket so access
+#     works in THIS session too, since group membership only lands at the
+#     next login. The ACL dies with the daemon; the group is what remains.
+cmd_daemon_start() {
+  require_docker
+  command -v systemctl >/dev/null 2>&1 || die "no-systemctl"
+  command -v pkexec >/dev/null 2>&1 || die "polkit-missing"
+
+  # Already answering — someone else won the race. Not an error.
+  docker info >/dev/null 2>&1 && return 0
+
+  local me
+  me=$(id -un)
+
+  local needs_start=0 needs_grant=0
+  systemctl is-active --quiet docker.service || needs_start=1
+  if docker_permission_denied || ! id -nG "$me" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    needs_grant=1
+  fi
+
+  if ((needs_start == 1 || needs_grant == 1)); then
+    # The username travels as a positional argument, never interpolated into
+    # the script, so no name can ever be read as shell by root. pkexec's own
+    # stderr is dropped because the panel surfaces whatever this script
+    # prints, and the exit code already says what happened: 126 is a
+    # dismissed dialog, 127 a refused authorization — neither is a failure
+    # of docker, so they get their own words.
+    pkexec sh -c '
+      set -e
+      if [ "$1" = 1 ]; then systemctl start docker.service; fi
+      if [ "$2" = 1 ]; then
+        groupadd -f docker
+        usermod -aG docker "$3"
+        if [ -S /var/run/docker.sock ] && command -v setfacl >/dev/null 2>&1; then
+          setfacl -m "u:$3:rw" /var/run/docker.sock
+        fi
+      fi
+    ' fix "$needs_start" "$needs_grant" "$me" 2>/dev/null
+    local rc=$?
+    if ((rc == 126 || rc == 127)); then die "daemon-start-dismissed"; fi
+    ((rc == 0)) || die "daemon-start-failed"
+  fi
+
+  # systemctl returns when the unit is active, but dockerd needs a moment more
+  # before its socket answers. Without this wait the refresh that follows the
+  # click would repaint the very error the user just fixed.
+  local deadline=$((SECONDS + 30))
+  while ((SECONDS < deadline)); do
+    docker info >/dev/null 2>&1 && return 0
+    if docker_permission_denied; then
+      # The group is joined but the socket still refuses: the ACL half of
+      # the grant could not land (no setfacl, an unusual socket path), so
+      # what remains is the part only a new login applies. Waiting longer
+      # cannot change that — stop the clock and say so.
+      ((needs_grant == 1)) && die "daemon-grant-relogin"
+      die "docker-permission"
+    fi
+    sleep 1
+  done
+  die "daemon-start-timeout"
+}
+
 # CPU and memory. Kept out of `list` on purpose: measured on this machine,
 # `docker stats --no-stream` costs a flat ~2000 ms whether there are zero, one
 # or five containers — it waits for two samples a second apart to compute a
@@ -476,6 +569,7 @@ case "${1:-}" in
   list) cmd_list "${2:-}" ;;
   start | stop | restart | pause | unpause | kill) cmd_lifecycle "$1" "${2:-}" "${3:-}" ;;
   remove) cmd_remove "${2:-}" ;;
+  daemon-start) cmd_daemon_start ;;
   stats) cmd_stats ;;
   logs | shell) cmd_terminal "$1" "${2:-}" ;;
   open) cmd_open "${2:-}" "${3:-}" ;;
@@ -485,6 +579,7 @@ case "${1:-}" in
   *)
     cat >&2 <<'USAGE'
 usage: docker-vm-ctl list [filter]
+       docker-vm-ctl daemon-start
        docker-vm-ctl stats
        docker-vm-ctl start|restart|pause|unpause|kill|remove <name>
        docker-vm-ctl stop <name> [timeout]
