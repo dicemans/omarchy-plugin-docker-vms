@@ -95,6 +95,35 @@ diagnose_unreachable() {
   die "daemon-unreachable"
 }
 
+# Between the fix button's `usermod -aG docker` and the user's next login
+# there is a window where /etc/group grants the docker group but no process
+# has it yet. The socket ACL papers over that for docker itself, but not for
+# anything that checks group membership on files — omarchy-windows-vm keeps
+# its compose root:docker 0640, so a VM launch in that window died on a file
+# read. `newgrp` closes the window: it applies a membership the system
+# already records — no elevation, no password for a member — so the helper
+# re-runs itself under the group once and everything it spawns inherits it.
+# After the next real login the group is simply present and this is a no-op.
+adopt_docker_group() {
+  [[ ${DOCKER_VM_CTL_SG:-} == 1 ]] && return 0
+  command -v newgrp >/dev/null 2>&1 || return 0
+  id -nG | tr ' ' '\n' | grep -qx docker && return 0
+  local me
+  me=$(id -un)
+  # `id -nG <user>` reads the user database, not this process: it sees what
+  # usermod wrote, which is exactly the gap being bridged.
+  id -nG "$me" 2>/dev/null | tr ' ' '\n' | grep -qx docker || return 0
+  # newgrp execs the login shell with the group applied; handing it a single
+  # `exec` line on stdin turns that shell into this script re-run with the
+  # membership in place, stdout and stderr untouched. Not `| exec newgrp`:
+  # exec inside a pipeline replaces only the pipeline's subshell, and the
+  # script would carry on groupless behind the re-run's back. The guard
+  # above stops a loop if the adoption cannot take.
+  export DOCKER_VM_CTL_SG=1
+  printf 'exec %s\n' "$(printf '%q ' "$0" "$@")" | newgrp docker
+  exit $?
+}
+
 # The one place that decides whether a container is a desktop VM worth
 # offering a session button for. Image name is the honest signal: the dockur
 # images are named for their guest, and anything else is a plain container.
@@ -564,6 +593,8 @@ cmd_viewer() {
     launch_detached xdg-open "$url"
   fi
 }
+
+adopt_docker_group "$@"
 
 case "${1:-}" in
   list) cmd_list "${2:-}" ;;
